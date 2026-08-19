@@ -1,0 +1,1250 @@
+#!/usr/bin/env node
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import readline from "node:readline";
+import { createHash } from "node:crypto";
+
+const DEFAULT_PORT = 9222;
+const CHATGPT_URL = "https://chatgpt.com/";
+const SERVER_NAME = "chatgpt-web-bridge";
+const SERVER_VERSION = "0.1.0";
+const DEFAULT_MAX_ROUNDS = 20;
+const HARD_MAX_ROUNDS = 50;
+const MAX_CONTEXT_CHARS = 24000;
+const DEFAULT_SESSION_ID = "default";
+const SESSION_DIR = path.join(process.env.LOCALAPPDATA || os.homedir(), "CodexChatGPTBridge", "sessions");
+
+let socket = null;
+let target = null;
+let commandId = 0;
+const pending = new Map();
+let selectedConversation = null;
+let activeTargetId = null;
+let activeSessionId = DEFAULT_SESSION_ID;
+let activeSession = null;
+
+function newBrainState() {
+  return {
+    mode: "brain-hand",
+    goal: "",
+    constraints: [],
+    maxRounds: DEFAULT_MAX_ROUNDS,
+    round: 0,
+    latestPlan: null,
+    latestReport: null,
+    latestReview: null,
+    seenTaskFingerprints: [],
+    seenReportFingerprints: [],
+    seenDecisionFingerprints: [],
+    lastWebReply: "",
+    startedAt: null,
+  };
+}
+
+let brainState = newBrainState();
+
+function normalizeSessionId(value = DEFAULT_SESSION_ID) {
+  const id = String(value || DEFAULT_SESSION_ID).trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(id)) {
+    throw new Error("session_id must start with a letter or number and contain only letters, numbers, dot, underscore, or hyphen");
+  }
+  return id;
+}
+
+function sessionIdOf(args = {}) {
+  return normalizeSessionId(args.session_id ?? args.sessionId ?? DEFAULT_SESSION_ID);
+}
+
+function newSessionState(sessionId, name = "") {
+  const now = new Date().toISOString();
+  return {
+    session_id: sessionId,
+    name: firstNonEmpty(name, sessionId),
+    conversation: null,
+    target_id: null,
+    target_url: null,
+    brain_state: newBrainState(),
+    created_at: now,
+    updated_at: now,
+  };
+}
+
+function sessionFile(sessionId) {
+  return path.join(SESSION_DIR, `session-${normalizeSessionId(sessionId)}.json`);
+}
+
+function readSession(sessionId, create = true) {
+  const id = normalizeSessionId(sessionId);
+  fs.mkdirSync(SESSION_DIR, { recursive: true });
+  try {
+    const parsed = JSON.parse(fs.readFileSync(sessionFile(id), "utf8"));
+    return {
+      ...newSessionState(id),
+      ...parsed,
+      session_id: id,
+      brain_state: { ...newBrainState(), ...(parsed.brain_state || {}) },
+    };
+  } catch (error) {
+    if (error?.code !== "ENOENT" || !create) throw error;
+    const session = newSessionState(id);
+    writeSession(session);
+    return session;
+  }
+}
+
+function writeSession(session) {
+  fs.mkdirSync(SESSION_DIR, { recursive: true });
+  session.updated_at = new Date().toISOString();
+  fs.writeFileSync(sessionFile(session.session_id), `${JSON.stringify(session, null, 2)}\n`, "utf8");
+}
+
+function activateSession(args = {}) {
+  const id = sessionIdOf(args);
+  activeSession = readSession(id);
+  activeSessionId = id;
+  brainState = activeSession.brain_state;
+  selectedConversation = activeSession.conversation;
+  return activeSession;
+}
+
+function ensureActiveSession(args = {}) {
+  const id = sessionIdOf(args);
+  if (!activeSession || activeSessionId !== id) return activateSession({ ...args, session_id: id });
+  return activeSession;
+}
+
+function persistActiveSession() {
+  if (!activeSession) return;
+  activeSession.brain_state = brainState;
+  activeSession.conversation = selectedConversation;
+  if (activeTargetId) activeSession.target_id = activeTargetId;
+  if (target?.url) activeSession.target_url = target.url;
+  writeSession(activeSession);
+}
+
+function sessionSummary(session) {
+  const brain = session.brain_state || newBrainState();
+  return {
+    session_id: session.session_id,
+    name: session.name || session.session_id,
+    conversation: session.conversation || null,
+    target_id: session.target_id || null,
+    round: brain.round || 0,
+    max_rounds: brain.maxRounds || DEFAULT_MAX_ROUNDS,
+    goal: brain.goal || "",
+    updated_at: session.updated_at || null,
+  };
+}
+
+function listStoredSessions() {
+  fs.mkdirSync(SESSION_DIR, { recursive: true });
+  return fs.readdirSync(SESSION_DIR)
+    .filter(name => /^session-[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.json$/.test(name))
+    .map(name => {
+      try { return sessionSummary(JSON.parse(fs.readFileSync(path.join(SESSION_DIR, name), "utf8"))); }
+      catch { return null; }
+    })
+    .filter(Boolean)
+    .sort((left, right) => String(left.name).localeCompare(String(right.name)));
+}
+
+function createSession(args = {}) {
+  const rawId = args.session_id ?? args.sessionId;
+  if (!String(rawId || "").trim()) {
+    return jsonResult("session_id is required when creating a session", { created: false }, true);
+  }
+  let id;
+  try { id = normalizeSessionId(rawId); }
+  catch (error) { return jsonResult(String(error), { created: false }, true); }
+  const file = sessionFile(id);
+  if (fs.existsSync(file)) {
+    return jsonResult(`session already exists: ${id}`, { created: false, session_id: id }, true);
+  }
+  const session = newSessionState(id, args.name);
+  writeSession(session);
+  activeSession = session;
+  activeSessionId = id;
+  brainState = session.brain_state;
+  selectedConversation = null;
+  activeTargetId = null;
+  return jsonResult(`session created: ${id}`, { created: true, session: sessionSummary(session) });
+}
+
+function listSessions() {
+  return jsonResult("stored bridge sessions", {
+    active_session_id: activeSessionId,
+    sessions: listStoredSessions(),
+  });
+}
+
+function claimedTargetIds(excludeSessionId = "") {
+  const claimed = new Set();
+  for (const session of listStoredSessions()) {
+    if (session.session_id !== excludeSessionId && session.target_id) claimed.add(session.target_id);
+  }
+  return claimed;
+}
+
+function jsonResult(text, structuredContent = undefined, isError = false) {
+  const result = { content: [{ type: "text", text }], isError };
+  if (structuredContent !== undefined) result.structuredContent = structuredContent;
+  return result;
+}
+
+function clip(value, limit = MAX_CONTEXT_CHARS) {
+  const text = String(value ?? "");
+  return text.length <= limit ? text : `${text.slice(0, limit)}\n...[truncated]`;
+}
+
+function stringList(value) {
+  if (value === undefined || value === null || value === "") return [];
+  const values = Array.isArray(value) ? value : [value];
+  return values.map(item => String(item).trim()).filter(Boolean).slice(0, 50);
+}
+
+function maxRoundsOf(value) {
+  const parsed = Number(value ?? DEFAULT_MAX_ROUNDS);
+  if (!Number.isInteger(parsed) || parsed < 1) return DEFAULT_MAX_ROUNDS;
+  return Math.min(parsed, HARD_MAX_ROUNDS);
+}
+
+function fingerprint(value) {
+  const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
+  return createHash("sha256").update(text).digest("hex").slice(0, 16);
+}
+
+function firstNonEmpty(...values) {
+  return values.find(value => typeof value === "string" && value.trim())?.trim() || "";
+}
+
+function findJsonObject(text) {
+  const source = String(text || "");
+  const fenced = source.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidates = [fenced?.[1], source].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate.trim());
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch {}
+    let start = -1;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = 0; index < candidate.length; index += 1) {
+      const char = candidate[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') inString = false;
+        continue;
+      }
+      if (char === '"') {
+        inString = true;
+        continue;
+      }
+      if (char === "{") {
+        if (start < 0) start = index;
+        depth += 1;
+      } else if (char === "}" && start >= 0) {
+        depth -= 1;
+        if (depth === 0) {
+          try {
+            const parsed = JSON.parse(candidate.slice(start, index + 1));
+            if (parsed && typeof parsed === "object") return parsed;
+          } catch {}
+          start = -1;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function normalizeStatus(value, text = "") {
+  const source = String(value || text || "").toLowerCase();
+  if (/completed|complete|done|finished|success|已完成|完成/.test(source)) return "completed";
+  if (/blocked|blocker|blocked|阻塞|无法继续|被阻塞/.test(source)) return "blocked";
+  if (/repeated|repeat|loop|duplicate|重复|循环/.test(source)) return "repeated";
+  if (/max[_ -]?round|轮数上限/.test(source)) return "max_rounds";
+  return "continue";
+}
+
+function taskFromReply(parsed, rawReply) {
+  const plan = parsed?.plan && typeof parsed.plan === "object" ? parsed.plan : {};
+  const task = firstNonEmpty(
+    parsed?.next_task,
+    parsed?.nextTask,
+    parsed?.task,
+    parsed?.next_action,
+    parsed?.nextAction,
+    parsed?.action,
+    plan.next_task,
+    plan.task,
+  );
+  const acceptance = stringList(parsed?.acceptance ?? parsed?.acceptance_criteria ?? parsed?.acceptanceCriteria ?? plan.acceptance);
+  const constraints = stringList(parsed?.constraints ?? plan.constraints);
+  const evidence = stringList(parsed?.evidence ?? parsed?.required_evidence ?? parsed?.requiredEvidence ?? plan.evidence);
+  const reason = firstNonEmpty(parsed?.reason, parsed?.rationale, parsed?.summary, plan.reason);
+  return {
+    task: task || clip(rawReply, 6000),
+    acceptance,
+    constraints,
+    evidence,
+    reason,
+  };
+}
+
+function decisionFromReply(rawReply) {
+  const parsed = findJsonObject(rawReply) || {};
+  const task = taskFromReply(parsed, rawReply);
+  const status = normalizeStatus(parsed.status ?? parsed.decision ?? parsed.result, rawReply);
+  return {
+    status,
+    ...task,
+    raw_reply: clip(rawReply),
+    parsed,
+  };
+}
+
+function recordTask(task) {
+  const key = fingerprint({ task: task.task, acceptance: task.acceptance, constraints: task.constraints });
+  if (key && !brainState.seenTaskFingerprints.includes(key)) brainState.seenTaskFingerprints.push(key);
+  return key;
+}
+
+function recordReport(report) {
+  const key = fingerprint(report);
+  if (key) {
+    brainState.seenReportFingerprints.push(key);
+    if (brainState.seenReportFingerprints.length > 100) brainState.seenReportFingerprints.shift();
+  }
+  return key;
+}
+
+function brainStateView() {
+  return {
+    session_id: activeSessionId,
+    mode: brainState.mode,
+    goal: brainState.goal,
+    constraints: brainState.constraints,
+    round: brainState.round,
+    max_rounds: brainState.maxRounds,
+    latest_plan: brainState.latestPlan,
+    latest_report: brainState.latestReport,
+    latest_review: brainState.latestReview,
+    conversation: selectedConversation,
+    browser_target_id: activeSession?.target_id || null,
+    started_at: brainState.startedAt,
+    connected: Boolean(socket && socket.readyState === WebSocket.OPEN),
+  };
+}
+
+function resultText(result) {
+  return result?.content?.find(item => item.type === "text")?.text || "";
+}
+
+function planPrompt(goal, constraints, context) {
+  return `You are the planning brain supervising Codex Luna, which is the local execution agent.
+Create the next concrete, verifiable task for Luna. Do not claim that you edited files or ran commands.
+Use only the supplied context. Return JSON only, with this shape:
+{"status":"continue","task":"one concrete next task","constraints":["..."],"acceptance":["..."],"evidence":["..."],"reason":"brief explanation"}
+Allowed status values: continue, completed, blocked.
+
+GOAL:
+${clip(goal)}
+
+CONSTRAINTS:
+${JSON.stringify(constraints)}
+
+CURRENT CONTEXT:
+${clip(context || "No execution has started.")}`;
+}
+
+function reportPrompt(report) {
+  return `The Codex Luna executor has submitted the following execution report.
+Record it as external evidence. Do not invent local changes, and do not provide a long analysis yet.
+Reply with a concise acknowledgement and one important question only if required.
+
+GOAL:
+${clip(brainState.goal)}
+
+ROUND: ${brainState.round}
+
+EXECUTOR REPORT:
+${clip(report)}`;
+}
+
+function reviewPrompt(reportOverride = "") {
+  const report = reportOverride || JSON.stringify(brainState.latestReport || {}, null, 2);
+  return `You are the planning brain reviewing Codex Luna's latest work.
+Decide whether the task is completed, blocked, repeated, or should continue.
+Return JSON only, with this shape:
+{"status":"continue|completed|blocked|repeated","next_task":"one concrete next task or empty","constraints":["..."],"acceptance":["..."],"evidence":["..."],"reason":"brief decision reason"}
+Use completed only when the acceptance criteria are actually met. Use blocked when Luna cannot proceed without missing information or approval. Use repeated when the same action/result is looping without new evidence.
+
+GOAL:
+${clip(brainState.goal)}
+
+CURRENT PLAN:
+${clip(JSON.stringify(brainState.latestPlan || {}, null, 2))}
+
+LATEST EXECUTOR REPORT:
+${clip(report)}
+
+PREVIOUS REVIEW:
+${clip(JSON.stringify(brainState.latestReview || {}, null, 2))}`;
+}
+
+function normalizeReport(args = {}) {
+  const raw = firstNonEmpty(args.report, args.executor_report, args.result, args.summary);
+  const reportObject = raw ? findJsonObject(raw) : null;
+  return {
+    round: Number.isInteger(Number(args.round)) ? Number(args.round) : brainState.round,
+    status: firstNonEmpty(args.status, reportObject?.status) || "reported",
+    report: clip(raw || JSON.stringify({
+      changes: stringList(args.changes),
+      tests: stringList(args.tests),
+      blockers: stringList(args.blockers),
+      evidence: stringList(args.evidence),
+    }, null, 2)),
+    changes: stringList(args.changes ?? reportObject?.changes),
+    tests: stringList(args.tests ?? reportObject?.tests),
+    blockers: stringList(args.blockers ?? reportObject?.blockers),
+    evidence: stringList(args.evidence ?? reportObject?.evidence),
+  };
+}
+
+async function brainPlan(args = {}) {
+  activateSession(args);
+  const goal = clip(args.goal);
+  if (!goal.trim()) return jsonResult("goal is required", { planned: false }, true);
+  brainState = newBrainState();
+  brainState.goal = goal;
+  brainState.constraints = stringList(args.constraints);
+  brainState.maxRounds = maxRoundsOf(args.max_rounds);
+  brainState.startedAt = new Date().toISOString();
+  const prompt = planPrompt(goal, brainState.constraints, args.context);
+  const result = await askChatGPT({ ...args, port: args.port, timeout_ms: args.timeout_ms, prompt });
+  if (result.isError) return result;
+  const rawReply = resultText(result);
+  brainState.lastWebReply = rawReply;
+  const decision = decisionFromReply(rawReply);
+  const plan = { round: 0, ...decision };
+  brainState.latestPlan = plan;
+  recordTask(plan);
+  persistActiveSession();
+  return jsonResult(`brain plan ready: ${plan.task}`, {
+    planned: true,
+    mode: brainState.mode,
+    round: brainState.round,
+    max_rounds: brainState.maxRounds,
+    status: plan.status,
+    task: plan.task,
+    constraints: plan.constraints,
+    acceptance: plan.acceptance,
+    evidence: plan.evidence,
+    reason: plan.reason,
+    raw_reply: rawReply,
+  });
+}
+
+async function executorReport(args = {}) {
+  activateSession(args);
+  if (!brainState.goal) return jsonResult("call brain_plan before executor_report", { reported: false }, true);
+  const report = normalizeReport(args);
+  if (!report.report.trim() || report.report === "{}") {
+    return jsonResult("report, result, summary, or execution fields are required", { reported: false }, true);
+  }
+  brainState.latestReport = report;
+  recordReport(report);
+  const result = await askChatGPT({ ...args, port: args.port, timeout_ms: args.timeout_ms, prompt: reportPrompt(JSON.stringify(report, null, 2)) });
+  if (result.isError) return result;
+  const acknowledgement = resultText(result);
+  brainState.lastWebReply = acknowledgement;
+  persistActiveSession();
+  return jsonResult("executor report sent to ChatGPT Web", {
+    reported: true,
+    round: report.round,
+    report,
+    web_ack: acknowledgement,
+  });
+}
+
+async function brainReview(args = {}) {
+  activateSession(args);
+  if (!brainState.goal) return jsonResult("call brain_plan before brain_review", { reviewed: false }, true);
+  if (args.report || args.result || args.summary || args.changes || args.tests || args.blockers || args.evidence) {
+    brainState.latestReport = normalizeReport(args);
+    recordReport(brainState.latestReport);
+  }
+  if (!brainState.latestReport) return jsonResult("executor report is required before brain_review", { reviewed: false }, true);
+  const result = await askChatGPT({ ...args, port: args.port, timeout_ms: args.timeout_ms, prompt: reviewPrompt() });
+  if (result.isError) return result;
+  const rawReply = resultText(result);
+  brainState.lastWebReply = rawReply;
+  const decision = decisionFromReply(rawReply);
+  const decisionKey = fingerprint({ status: decision.status, task: decision.task, acceptance: decision.acceptance, reason: decision.reason });
+  const reportKey = fingerprint(brainState.latestReport);
+  const repeated = decision.status === "continue" && (
+    brainState.seenDecisionFingerprints.includes(decisionKey)
+    || (reportKey && brainState.seenReportFingerprints.filter(key => key === reportKey).length > 1)
+  );
+  if (!brainState.seenDecisionFingerprints.includes(decisionKey)) brainState.seenDecisionFingerprints.push(decisionKey);
+  if (repeated) {
+    decision.status = "repeated";
+    decision.reason = decision.reason || "the same plan/report decision repeated without new evidence";
+  }
+  brainState.latestReview = { round: brainState.round, ...decision, repeated_detected: repeated };
+  persistActiveSession();
+  return jsonResult(`brain review: ${brainState.latestReview.status}`, {
+    reviewed: true,
+    round: brainState.round,
+    status: brainState.latestReview.status,
+    next_task: brainState.latestReview.task,
+    constraints: brainState.latestReview.constraints,
+    acceptance: brainState.latestReview.acceptance,
+    evidence: brainState.latestReview.evidence,
+    reason: brainState.latestReview.reason,
+    repeated_detected: repeated,
+    raw_reply: rawReply,
+  });
+}
+
+async function continueTask(args = {}) {
+  activateSession(args);
+  if (!brainState.goal) return jsonResult("call brain_plan before continue_task", { continued: false }, true);
+  if (args.max_rounds !== undefined) brainState.maxRounds = maxRoundsOf(args.max_rounds);
+  if (args.executor_report || args.result || args.summary || args.changes || args.tests || args.blockers || args.evidence) {
+    const reportResult = await executorReport(args);
+    if (reportResult.isError) return reportResult;
+  }
+  const reviewResult = brainState.latestReview && !args.review
+    ? jsonResult("using latest brain review", brainState.latestReview)
+    : await brainReview(args);
+  if (reviewResult.isError) return reviewResult;
+  const review = brainState.latestReview;
+  if (["completed", "blocked", "repeated"].includes(review.status)) {
+    return jsonResult(`task stopped: ${review.status}`, {
+      continued: false,
+      stopped: true,
+      status: review.status,
+      round: brainState.round,
+      reason: review.reason,
+      state: brainStateView(),
+    });
+  }
+  if (brainState.round >= brainState.maxRounds - 1) {
+    brainState.latestReview.status = "max_rounds";
+    persistActiveSession();
+    return jsonResult(`task stopped: max rounds ${brainState.maxRounds}`, {
+      continued: false,
+      stopped: true,
+      status: "max_rounds",
+      round: brainState.round,
+      max_rounds: brainState.maxRounds,
+      state: brainStateView(),
+    });
+  }
+  brainState.round += 1;
+  const nextPlan = { round: brainState.round, status: "continue", task: review.task, acceptance: review.acceptance, constraints: review.constraints, evidence: review.evidence, reason: review.reason };
+  brainState.latestPlan = nextPlan;
+  recordTask(nextPlan);
+  persistActiveSession();
+  return jsonResult(`continue task round ${brainState.round}: ${nextPlan.task}`, {
+    continued: true,
+    stopped: false,
+    status: "continue",
+    round: brainState.round,
+    max_rounds: brainState.maxRounds,
+    task: nextPlan.task,
+    constraints: nextPlan.constraints,
+    acceptance: nextPlan.acceptance,
+    evidence: nextPlan.evidence,
+    state: brainStateView(),
+  });
+}
+
+function brainStatus(args = {}) {
+  activateSession(args);
+  return jsonResult("brain-hand state", brainStateView());
+}
+
+function brainReset(args = {}) {
+  activateSession(args);
+  brainState = newBrainState();
+  persistActiveSession();
+  return jsonResult("brain-hand state reset", brainStateView());
+}
+
+function portOf(args = {}) {
+  const value = Number(args.port ?? process.env.CHATGPT_BRIDGE_PORT ?? DEFAULT_PORT);
+  if (!Number.isInteger(value) || value < 1 || value > 65535) {
+    throw new Error("port must be an integer between 1 and 65535");
+  }
+  return value;
+}
+
+async function getJson(url, options = {}) {
+  const response = await fetch(url, options);
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText} from ${url}`);
+  return response.json();
+}
+
+async function listTargets(port) {
+  return getJson(`http://127.0.0.1:${port}/json/list`);
+}
+
+function closeSocket() {
+  if (socket) {
+    try { socket.close(); } catch {}
+  }
+  socket = null;
+  target = null;
+  activeTargetId = null;
+  for (const reject of pending.values()) reject(new Error("browser connection closed"));
+  pending.clear();
+}
+
+async function connectToTarget(nextTarget) {
+  if (!nextTarget?.webSocketDebuggerUrl) throw new Error("target has no DevTools websocket");
+  closeSocket();
+  target = nextTarget;
+  activeTargetId = nextTarget.id || null;
+  socket = new WebSocket(nextTarget.webSocketDebuggerUrl);
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("timed out connecting to browser")), 8000);
+    socket.addEventListener("open", () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+    socket.addEventListener("error", () => {
+      clearTimeout(timer);
+      reject(new Error("could not connect to browser DevTools"));
+    }, { once: true });
+  });
+  socket.addEventListener("message", event => {
+    try {
+      const message = JSON.parse(String(event.data));
+      if (message.id && pending.has(message.id)) {
+        const { resolve, reject } = pending.get(message.id);
+        pending.delete(message.id);
+        if (message.error) reject(new Error(message.error.message || "DevTools command failed"));
+        else resolve(message.result);
+      }
+    } catch {}
+  });
+  socket.addEventListener("close", closeSocket, { once: true });
+  await cdpRaw("Runtime.enable", {});
+  await cdpRaw("Page.enable", {});
+}
+
+function cdpRaw(method, params) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error("browser is not connected"));
+  }
+  const id = ++commandId;
+  socket.send(JSON.stringify({ id, method, params }));
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    setTimeout(() => {
+      if (pending.has(id)) {
+        pending.delete(id);
+        reject(new Error(`DevTools command timed out: ${method}`));
+      }
+    }, 30000);
+  });
+}
+
+async function evaluate(expression) {
+  const result = await cdpRaw("Runtime.evaluate", {
+    expression,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  if (result?.exceptionDetails) {
+    const detail = result.exceptionDetails.exception?.description || result.exceptionDetails.text || "unknown page error";
+    throw new Error(`page evaluation failed: ${detail}`);
+  }
+  return result?.result?.value;
+}
+
+async function createChatGPTTarget(port) {
+  const response = await fetch(`http://127.0.0.1:${port}/json/new?${CHATGPT_URL}`, { method: "PUT" });
+  if (!response.ok) throw new Error(`could not create a browser tab: ${response.status} ${response.statusText}`);
+  const created = await response.json();
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try {
+      const targets = await listTargets(port);
+      const ready = created?.id ? targets.find(item => item.id === created.id) : null;
+      if (ready?.webSocketDebuggerUrl) return ready;
+      if (created?.webSocketDebuggerUrl && attempt >= 2) return created;
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  return created;
+}
+
+async function findChatGPTTarget(port, session = activeSession) {
+  const targets = await listTargets(port);
+  const pages = targets.filter(item => item.type === "page");
+  if (session?.target_id) {
+    const stored = pages.find(item => item.id === session.target_id);
+    if (stored) return stored;
+  }
+  if (session?.conversation?.id) {
+    const stored = pages.find(item => conversationIdFromUrl(item.url || "") === session.conversation.id);
+    if (stored) return stored;
+  }
+  const claimed = claimedTargetIds(session?.session_id || "");
+  return pages.find(item => /chatgpt\.com/i.test(item.url || "") && !claimed.has(item.id)) || null;
+}
+
+async function ensureConnected(port, session = activeSession) {
+  if (socket && socket.readyState === WebSocket.OPEN && target && session?.target_id === target.id) return;
+  let page = await findChatGPTTarget(port, session) || await createChatGPTTarget(port);
+  if (!page) {
+    throw new Error(`no browser page found. Launch a browser with remote debugging on port ${port}, then open ${CHATGPT_URL}`);
+  }
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await connectToTarget(page);
+      lastError = null;
+      break;
+    } catch (error) {
+      lastError = error;
+      closeSocket();
+      await new Promise(resolve => setTimeout(resolve, 350));
+      try {
+        const targets = await listTargets(port);
+        page = (page.id && targets.find(item => item.id === page.id)) || await findChatGPTTarget(port, session);
+      } catch {}
+    }
+  }
+  if (lastError) throw lastError;
+  if (session) {
+    session.target_id = page.id || null;
+    session.target_url = page.url || null;
+    persistActiveSession();
+  }
+}
+
+function conversationIdFromUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    const match = url.pathname.match(/^\/c\/([^/]+)/i);
+    return match?.[1] || null;
+  } catch {
+    return null;
+  }
+}
+
+function safeConversationUrl(rawUrlOrId) {
+  const value = String(rawUrlOrId || "").trim();
+  if (!value) return null;
+  if (/^[A-Za-z0-9_-]{8,}$/.test(value)) return `${CHATGPT_URL}c/${value}`;
+  let url;
+  try { url = new URL(value); } catch { return null; }
+  if (!/^(chatgpt\.com|www\.chatgpt\.com)$/i.test(url.hostname)) return null;
+  if (!/^\/c\/[A-Za-z0-9_-]+$/i.test(url.pathname)) return null;
+  return `https://chatgpt.com${url.pathname}`;
+}
+
+async function currentConversationData() {
+  return evaluate(`(() => {
+    const url = location.href;
+    const match = location.pathname.match(/^\\/c\\/([^/]+)/i);
+    const current = [...document.querySelectorAll('a[href*="/c/"]')].find(anchor => anchor.href.split('?')[0] === url.split('?')[0]);
+    const rawTitle = (current?.getAttribute('aria-label') || current?.innerText || document.title || '').trim();
+    const title = rawTitle.replace('，已置顶对话', '').replace('（未读）', '').trim();
+    return { id: match?.[1] || null, title, url, is_conversation: Boolean(match) };
+  })()`);
+}
+
+async function visibleConversations(query = "") {
+  const queryLiteral = JSON.stringify(String(query || "").trim().toLowerCase());
+  return evaluate(`(() => {
+    const query = ${queryLiteral};
+    const seen = new Set();
+    return [...document.querySelectorAll('a[href*="/c/"]')].map(anchor => {
+      const url = anchor.href.split('?')[0];
+      const match = new URL(url).pathname.match(/^\\/c\\/([^/]+)/i);
+      const rawTitle = (anchor.getAttribute('aria-label') || anchor.innerText || '').trim();
+      const title = rawTitle.replace('，已置顶对话', '').replace('（未读）', '').trim();
+      return { id: match?.[1] || null, title, url, current: url === location.href.split('?')[0] };
+    }).filter(item => item.id && item.title && !seen.has(item.id) && seen.add(item.id))
+      .filter(item => !query || item.title.toLowerCase().includes(query));
+  })()`);
+}
+
+async function listConversations(args = {}) {
+  activateSession(args);
+  const port = portOf(args);
+  try {
+    await ensureConnected(port, activeSession);
+    const conversations = await visibleConversations(args.query);
+    const current = await currentConversationData();
+    selectedConversation = current.is_conversation ? { id: current.id, title: current.title, url: current.url } : null;
+    persistActiveSession();
+    return jsonResult(`found ${conversations.length} visible ChatGPT conversations`, {
+      conversations,
+      current,
+      count: conversations.length,
+      session_id: activeSessionId,
+      browser_target_id: activeSession?.target_id || null,
+    });
+  } catch (error) {
+    return jsonResult(String(error), { conversations: [], count: 0, session_id: activeSessionId }, true);
+  }
+}
+
+async function selectConversation(args = {}) {
+  activateSession(args);
+  const port = portOf(args);
+  if (brainState.goal && !args.force) {
+    return jsonResult("an active brain-hand task exists; call brain_reset or pass force=true before switching conversations", {
+      selected: false,
+      active_goal: brainState.goal,
+      session_id: activeSessionId,
+    }, true);
+  }
+  try {
+    await ensureConnected(port, activeSession);
+    let destination = safeConversationUrl(args.url || args.conversation_id || args.id);
+    let chosen = null;
+    if (args.title) {
+      const conversations = await visibleConversations();
+      const wanted = String(args.title).trim().toLowerCase();
+      const exact = conversations.filter(item => item.title.toLowerCase() === wanted);
+      const partial = conversations.filter(item => item.title.toLowerCase().includes(wanted));
+      const matches = exact.length ? exact : partial;
+      if (matches.length !== 1) {
+        return jsonResult(matches.length ? "conversation title is ambiguous" : "conversation title was not found in the visible sidebar", {
+          selected: false,
+          query: args.title,
+          candidates: matches.slice(0, 20),
+        }, true);
+      }
+      chosen = matches[0];
+      destination = chosen.url;
+    }
+    if (!destination) return jsonResult("provide title, conversation_id, id, or a chatgpt.com conversation url", { selected: false }, true);
+    const safeUrl = safeConversationUrl(destination);
+    if (!safeUrl) return jsonResult("only chatgpt.com conversation URLs or conversation IDs are allowed", { selected: false }, true);
+    const destinationId = conversationIdFromUrl(safeUrl);
+    const current = await currentConversationData();
+    if (current.url.split('?')[0] !== safeUrl) await cdpRaw("Page.navigate", { url: safeUrl });
+    const deadline = Date.now() + Math.min(Math.max(Number(args.timeout_ms || 15000), 5000), 60000);
+    let state = current;
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 300));
+      state = await currentConversationData();
+      if (state.id === destinationId && state.url.split('?')[0] === safeUrl) break;
+    }
+    if (state.id !== destinationId) return jsonResult("timed out waiting for the selected conversation to open", { selected: false, url: safeUrl }, true);
+    selectedConversation = { id: state.id, title: chosen?.title || state.title, url: state.url };
+    persistActiveSession();
+    return jsonResult(`selected ChatGPT conversation: ${selectedConversation.title || selectedConversation.id}`, {
+      selected: true,
+      conversation: selectedConversation,
+      session_id: activeSessionId,
+      browser_target_id: activeSession?.target_id || null,
+    });
+  } catch (error) {
+    return jsonResult(String(error), { selected: false, session_id: activeSessionId }, true);
+  }
+}
+
+async function currentConversation(args = {}) {
+  activateSession(args);
+  const port = portOf(args);
+  try {
+    await ensureConnected(port, activeSession);
+    const current = await currentConversationData();
+    selectedConversation = current.is_conversation ? { id: current.id, title: current.title, url: current.url } : null;
+    persistActiveSession();
+    return jsonResult(current.is_conversation ? `current ChatGPT conversation: ${current.title || current.id}` : "ChatGPT is on the home page", {
+      current,
+      session_id: activeSessionId,
+      browser_target_id: activeSession?.target_id || null,
+    });
+  } catch (error) {
+    return jsonResult(String(error), { current: null, session_id: activeSessionId }, true);
+  }
+}
+
+function browserCandidates() {
+  const local = process.env.LOCALAPPDATA || "";
+  const programFiles = process.env.ProgramFiles || "C:\\Program Files";
+  const programFilesX86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+  return [
+    path.join(local, "Google", "Chrome", "Application", "chrome.exe"),
+    path.join(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
+    path.join(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
+    path.join(local, "Microsoft", "Edge", "Application", "msedge.exe"),
+    path.join(programFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
+    path.join(programFilesX86, "Microsoft", "Edge", "Application", "msedge.exe"),
+  ];
+}
+
+function defaultProfileDir() {
+  return path.join(process.env.LOCALAPPDATA || os.homedir(), "CodexChatGPTBridge", "profile");
+}
+
+function launchBrowser(args = {}) {
+  const executable = browserCandidates().find(candidate => fs.existsSync(candidate));
+  if (!executable) {
+    return {
+      launched: false,
+      message: "Chrome or Edge was not found. Start one manually with remote debugging enabled.",
+      command: `chrome.exe --remote-debugging-port=${portOf(args)} --user-data-dir=\\"${defaultProfileDir()}\\" ${CHATGPT_URL}`,
+    };
+  }
+  const port = portOf(args);
+  const profileDir = path.resolve(args.profile_dir || defaultProfileDir());
+  fs.mkdirSync(profileDir, { recursive: true });
+  const child = spawn(executable, [
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${profileDir}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    CHATGPT_URL,
+  ], { detached: true, stdio: "ignore", windowsHide: false });
+  child.unref();
+  return { launched: true, executable, port, profile_dir: profileDir, url: CHATGPT_URL };
+}
+
+async function browserStatus(args = {}) {
+  activateSession(args);
+  const port = portOf(args);
+  try {
+    const targets = await listTargets(port);
+    return jsonResult("browser is reachable", {
+      connected: Boolean(socket && socket.readyState === WebSocket.OPEN),
+      port,
+      session_id: activeSessionId,
+      assigned_target_id: activeSession?.target_id || null,
+      assigned_conversation_id: activeSession?.conversation?.id || null,
+      targets: targets.map(item => ({
+        id: item.id,
+        type: item.type,
+        title: item.title,
+        url: item.url,
+        conversation_id: conversationIdFromUrl(item.url || ""),
+        claimed_by_session: listStoredSessions().find(session => session.target_id === item.id)?.session_id || null,
+      })),
+    });
+  } catch (error) {
+    return jsonResult("browser is not reachable; launch the dedicated browser first", {
+      connected: false,
+      port,
+      session_id: activeSessionId,
+      error: String(error),
+      launch: `chatgpt_browser_launch with port ${port}`,
+    });
+  }
+}
+
+async function openChatGPT(args = {}) {
+  activateSession(args);
+  const port = portOf(args);
+  let page;
+  try {
+    page = await findChatGPTTarget(port, activeSession);
+  } catch (error) {
+    return jsonResult(String(error), { opened: false, port }, true);
+  }
+  if (!page) {
+    try {
+      page = await createChatGPTTarget(port);
+    } catch {}
+  }
+  if (!page) return jsonResult(`open ${CHATGPT_URL} manually in the remote-debug browser`, { opened: false, port }, true);
+  try {
+    await connectToTarget(page);
+    if (!/chatgpt\.com/i.test(page.url || "")) await cdpRaw("Page.navigate", { url: CHATGPT_URL });
+    try {
+      const current = await currentConversationData();
+      selectedConversation = current.is_conversation ? { id: current.id, title: current.title, url: current.url } : null;
+    } catch {}
+    activeSession.target_id = page.id || null;
+    activeSession.target_url = page.url || CHATGPT_URL;
+    persistActiveSession();
+    return jsonResult("ChatGPT Web page is ready; sign in manually if needed", {
+      opened: true,
+      url: target?.url || CHATGPT_URL,
+      port,
+      session_id: activeSessionId,
+      browser_target_id: activeSession.target_id,
+    });
+  } catch (error) {
+    return jsonResult(String(error), { opened: false, port, session_id: activeSessionId }, true);
+  }
+}
+
+async function pageSnapshot() {
+  return evaluate(`(() => {
+    const assistantNodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+    let messages = assistantNodes.map(node => (node.innerText || '').trim()).filter(Boolean);
+    if (!messages.length) {
+      messages = [...document.querySelectorAll('article')].map(node => (node.innerText || '').trim()).filter(Boolean);
+    }
+    const buttons = [...document.querySelectorAll('button')];
+    const streamingMarkup = Boolean(document.querySelector('.streaming-animation'));
+    const generating = streamingMarkup || buttons.some(button => /stop|generating|停止|生成中/i.test(
+      (button.getAttribute('aria-label') || '') + ' ' + (button.innerText || '')
+    ));
+    const bodyText = (document.body?.innerText || '').slice(0, 3000);
+    const loginRequired = location.pathname.includes('/auth/') || /log in|sign up|登录|注册/i.test(bodyText);
+    return { url: location.href, loginRequired, messages, last: messages.at(-1) || '', generating };
+  })()`);
+}
+
+async function askChatGPT(args = {}) {
+  const prompt = typeof args.prompt === "string" ? args.prompt.trim() : "";
+  if (!prompt) return jsonResult("prompt is required", { sent: false }, true);
+  const port = portOf(args);
+  const timeoutMs = Math.min(Math.max(Number(args.timeout_ms || 120000), 10000), 300000);
+  try {
+    ensureActiveSession(args);
+    await ensureConnected(port, activeSession);
+    const before = await pageSnapshot();
+    if (before.loginRequired) {
+      return jsonResult("ChatGPT Web requires manual sign-in in the dedicated browser", { sent: false, url: before.url }, true);
+    }
+    const promptLiteral = JSON.stringify(prompt);
+    const prepared = await evaluate(`(() => {
+      const value = ${promptLiteral};
+      const input = document.querySelector('[contenteditable="true"][role="textbox"]')
+        || document.querySelector('textarea:not([disabled])')
+        || document.querySelector('[contenteditable="true"]');
+      if (!input) return { ok: false, reason: 'input-not-found' };
+      input.focus();
+      return { ok: true, tag: input.tagName, contenteditable: input.isContentEditable };
+    })()`);
+    if (!prepared?.ok) return jsonResult(`could not prepare prompt: ${prepared?.reason || "unknown"}`, { sent: false }, true);
+
+    await cdpRaw("Input.dispatchKeyEvent", { type: "keyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
+    await cdpRaw("Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
+    await cdpRaw("Input.dispatchKeyEvent", { type: "keyDown", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+    await cdpRaw("Input.dispatchKeyEvent", { type: "keyUp", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+    await cdpRaw("Input.insertText", { text: prompt });
+    await new Promise(resolve => setTimeout(resolve, 250));
+    const sent = await evaluate(`(() => {
+      const buttons = [...document.querySelectorAll('button')];
+      const send = document.querySelector('button[data-testid="send-button"]')
+        || buttons.find(button => /send|发送/i.test(button.getAttribute('aria-label') || '') && !/stop|停止/i.test(button.getAttribute('aria-label') || ''));
+      if (!send) return { ok: false, reason: 'send-button-not-found' };
+      send.click();
+      return { ok: true };
+    })()`);
+    if (!sent?.ok) return jsonResult(`could not submit prompt: ${sent?.reason || "unknown"}`, { sent: false }, true);
+
+    const deadline = Date.now() + timeoutMs;
+    let previous = before.last;
+    let stablePolls = 0;
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 800));
+      const state = await pageSnapshot();
+      if (state.loginRequired) return jsonResult("ChatGPT Web requested sign-in after submission", { sent: true }, true);
+      const changed = state.last && (state.last !== before.last || state.messages.length > before.messages.length);
+      if (changed && state.last === previous) stablePolls += 1;
+      else if (changed) { previous = state.last; stablePolls = 0; }
+      if (changed && !state.generating && stablePolls >= 2) {
+        const current = await currentConversationData();
+        selectedConversation = current.is_conversation ? { id: current.id, title: current.title, url: current.url } : selectedConversation;
+        persistActiveSession();
+        return jsonResult(state.last, { sent: true, reply: state.last, url: state.url, session_id: activeSessionId, browser_target_id: activeSession?.target_id || null });
+      }
+    }
+    persistActiveSession();
+    return jsonResult("timed out waiting for a stable ChatGPT Web reply", { sent: true, last: previous, session_id: activeSessionId }, true);
+  } catch (error) {
+    return jsonResult(String(error), { sent: false, port, session_id: activeSessionId }, true);
+  }
+}
+
+const TOOLS = [
+  {
+    name: "chatgpt_browser_session_create",
+    description: "Create a persistent bridge session that owns one ChatGPT browser tab. Use a different session_id for each independent task; do not delete sessions through the bridge.",
+    inputSchema: { type: "object", properties: {
+      session_id: { type: "string", description: "Stable task/session key, for example task-a or task-c." },
+      name: { type: "string", description: "Human-readable session name." },
+    }, required: ["session_id"] },
+  },
+  {
+    name: "chatgpt_browser_session_list",
+    description: "List persistent bridge sessions, their assigned browser target, ChatGPT conversation, and brain-hand progress.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "chatgpt_browser_launch",
+    description: "Launch a dedicated Chrome/Edge profile with remote debugging and open ChatGPT Web. The user must sign in manually. Never use this to bypass login or CAPTCHA.",
+    inputSchema: { type: "object", properties: { port: { type: "integer", default: DEFAULT_PORT }, profile_dir: { type: "string" } } },
+  },
+  {
+    name: "chatgpt_browser_status",
+    description: "Read-only check of the remote-debug browser and visible tabs.",
+    inputSchema: { type: "object", properties: { port: { type: "integer", default: DEFAULT_PORT } } },
+  },
+  {
+    name: "chatgpt_browser_open",
+    description: "Open or connect to a visible ChatGPT Web page in the remote-debug browser. Use before asking if no page is connected.",
+    inputSchema: { type: "object", properties: { port: { type: "integer", default: DEFAULT_PORT } } },
+  },
+  {
+    name: "chatgpt_browser_list_conversations",
+    description: "List visible ChatGPT Web sidebar conversations with titles, IDs, URLs, and the current selection. Use query to filter titles.",
+    inputSchema: { type: "object", properties: { query: { type: "string" }, port: { type: "integer", default: DEFAULT_PORT } } },
+  },
+  {
+    name: "chatgpt_browser_select_conversation",
+    description: "Select a visible ChatGPT Web conversation by exact or unique title, conversation ID, or chatgpt.com conversation URL. Refuses to switch during an active brain-hand task unless force=true.",
+    inputSchema: { type: "object", properties: {
+      title: { type: "string" },
+      conversation_id: { type: "string" },
+      id: { type: "string" },
+      url: { type: "string" },
+      force: { type: "boolean", default: false },
+      timeout_ms: { type: "integer", default: 15000 },
+      port: { type: "integer", default: DEFAULT_PORT },
+    } },
+  },
+  {
+    name: "chatgpt_browser_current_conversation",
+    description: "Return the currently selected ChatGPT Web conversation title, ID, and URL.",
+    inputSchema: { type: "object", properties: { port: { type: "integer", default: DEFAULT_PORT } } },
+  },
+  {
+    name: "chatgpt_browser_ask",
+    description: "Send an explicit user-approved prompt through the visible ChatGPT Web page and return the visible assistant reply. Do not forward passwords, API keys, private credentials, or unapproved secrets.",
+    inputSchema: { type: "object", properties: { prompt: { type: "string" }, port: { type: "integer", default: DEFAULT_PORT }, timeout_ms: { type: "integer", default: 120000 } }, required: ["prompt"] },
+  },
+  {
+    name: "brain_plan",
+    description: "Start or reset the brain-hand mode. Ask ChatGPT Web to produce one concrete, verifiable next task for Codex Luna. The web model plans; Luna executes locally.",
+    inputSchema: { type: "object", properties: {
+      goal: { type: "string" },
+      context: { type: "string" },
+      constraints: { type: "array", items: { type: "string" } },
+      max_rounds: { type: "integer", default: DEFAULT_MAX_ROUNDS, maximum: HARD_MAX_ROUNDS },
+      port: { type: "integer", default: DEFAULT_PORT },
+      timeout_ms: { type: "integer", default: 120000 },
+    }, required: ["goal"] },
+  },
+  {
+    name: "executor_report",
+    description: "Send Codex Luna's execution result to the planning brain. Send concise final outcomes, changed files, tests, blockers, and evidence; never send hidden chain-of-thought, passwords, or tokens.",
+    inputSchema: { type: "object", properties: {
+      report: { type: "string" },
+      result: { type: "string" },
+      summary: { type: "string" },
+      changes: { type: "array", items: { type: "string" } },
+      tests: { type: "array", items: { type: "string" } },
+      blockers: { type: "array", items: { type: "string" } },
+      evidence: { type: "array", items: { type: "string" } },
+      status: { type: "string" },
+      round: { type: "integer" },
+      port: { type: "integer", default: DEFAULT_PORT },
+      timeout_ms: { type: "integer", default: 120000 },
+    } },
+  },
+  {
+    name: "brain_review",
+    description: "Ask the planning brain to review the latest Luna execution report and classify it as continue, completed, blocked, or repeated, with the next task and acceptance criteria.",
+    inputSchema: { type: "object", properties: {
+      report: { type: "string" },
+      result: { type: "string" },
+      summary: { type: "string" },
+      changes: { type: "array", items: { type: "string" } },
+      tests: { type: "array", items: { type: "string" } },
+      blockers: { type: "array", items: { type: "string" } },
+      evidence: { type: "array", items: { type: "string" } },
+      port: { type: "integer", default: DEFAULT_PORT },
+      timeout_ms: { type: "integer", default: 120000 },
+    } },
+  },
+  {
+    name: "continue_task",
+    description: "Advance brain-hand mode by one round. It can accept a new Luna execution report, review it, detect completion/blocking/repetition, enforce the configured round limit, and return the next executable task.",
+    inputSchema: { type: "object", properties: {
+      executor_report: { type: "string" },
+      report: { type: "string" },
+      result: { type: "string" },
+      summary: { type: "string" },
+      changes: { type: "array", items: { type: "string" } },
+      tests: { type: "array", items: { type: "string" } },
+      blockers: { type: "array", items: { type: "string" } },
+      evidence: { type: "array", items: { type: "string" } },
+      max_rounds: { type: "integer", maximum: HARD_MAX_ROUNDS },
+      review: { type: "boolean", default: false },
+      port: { type: "integer", default: DEFAULT_PORT },
+      timeout_ms: { type: "integer", default: 120000 },
+    } },
+  },
+  {
+    name: "brain_status",
+    description: "Read the current in-memory brain-hand mode state, including round, plan, report, review, and stop-related information.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "brain_reset",
+    description: "Reset the in-memory brain-hand mode state without changing browser data or deleting files.",
+    inputSchema: { type: "object", properties: {} },
+  },
+];
+
+for (const tool of TOOLS) {
+  if (!tool.inputSchema?.properties || tool.name.includes("session_")) continue;
+  tool.inputSchema.properties.session_id = {
+    type: "string",
+    default: DEFAULT_SESSION_ID,
+    description: "Persistent bridge session key. Sessions own separate ChatGPT browser tabs; A/B can share one key, C should use another.",
+  };
+}
+
+async function callTool(name, args) {
+  if (name === "chatgpt_browser_session_create") return createSession(args);
+  if (name === "chatgpt_browser_session_list") return listSessions();
+  if (name === "chatgpt_browser_launch") return jsonResult("dedicated browser launched; sign in manually", launchBrowser(args));
+  if (name === "chatgpt_browser_status") return browserStatus(args);
+  if (name === "chatgpt_browser_open") return openChatGPT(args);
+  if (name === "chatgpt_browser_list_conversations") return listConversations(args);
+  if (name === "chatgpt_browser_select_conversation") return selectConversation(args);
+  if (name === "chatgpt_browser_current_conversation") return currentConversation(args);
+  if (name === "chatgpt_browser_ask") return askChatGPT(args);
+  if (name === "brain_plan") return brainPlan(args);
+  if (name === "executor_report") return executorReport(args);
+  if (name === "brain_review") return brainReview(args);
+  if (name === "continue_task") return continueTask(args);
+  if (name === "brain_status") return brainStatus(args);
+  if (name === "brain_reset") return brainReset(args);
+  return jsonResult(`unknown tool: ${name}`, undefined, true);
+}
+
+async function handle(message) {
+  if (!message.id) return null;
+  if (message.method === "initialize") return { jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: SERVER_NAME, version: SERVER_VERSION } } };
+  if (message.method === "ping") return { jsonrpc: "2.0", id: message.id, result: {} };
+  if (message.method === "tools/list") return { jsonrpc: "2.0", id: message.id, result: { tools: TOOLS } };
+  if (message.method === "tools/call") {
+    const params = message.params || {};
+    return { jsonrpc: "2.0", id: message.id, result: await callTool(params.name, params.arguments || {}) };
+  }
+  return { jsonrpc: "2.0", id: message.id, error: { code: -32601, message: `Method not found: ${message.method}` } };
+}
+
+const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+for await (const line of input) {
+  if (!line.trim()) continue;
+  try {
+    const response = await handle(JSON.parse(line));
+    if (response) process.stdout.write(`${JSON.stringify(response)}\n`);
+  } catch (error) {
+    process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32603, message: String(error) } })}\n`);
+  }
+}

@@ -1,0 +1,20 @@
+# Local development and runtime data
+node_modules/
+coverage/
+*.log
+*.local
+.env
+.env.*
+!.env.example
+
+# Browser profiles and session state
+profile/
+test-profile-*/
+sessions/
+browser-profile/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

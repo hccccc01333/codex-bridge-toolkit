@@ -1,0 +1,4 @@
+interface:
+  display_name: "ChatGPT Brain-Hand Bridge"
+  short_description: "Let ChatGPT Web plan and Luna execute"
+  default_prompt: "Use $chatgpt-browser-bridge in brain-hand mode to plan, execute, report, review, and continue the task."

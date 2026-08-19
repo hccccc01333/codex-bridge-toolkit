@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "chatgptWebBridge": {
+      "title": "ChatGPT Web Bridge",
+      "description": "Relays explicit prompts through a user-logged-in ChatGPT Web browser session.",
+      "cwd": ".",
+      "command": "node",
+      "args": [
+        "./scripts/mcp_server.mjs"
+      ]
+    }
+  }
+}
