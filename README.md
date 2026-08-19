@@ -1,6 +1,6 @@
 # Codex Luna ChatGPT Bridge
 
-A local Codex plugin that lets visible ChatGPT Web act as the planning brain while Codex Luna executes work locally.
+A Codex plugin that lets visible ChatGPT Web act as the planning brain while Codex Luna executes work in the connected workspace.
 
 The bridge uses Chrome DevTools Protocol against a user-visible Chrome or Edge window. It does not use the ChatGPT API, private endpoints, passwords, cookies, CAPTCHA bypasses, or hidden conversation history. Sign in manually in the dedicated browser profile.
 
@@ -11,33 +11,25 @@ The bridge uses Chrome DevTools Protocol against a user-visible Chrome or Edge w
 - `brain_review`: classify the result as continue, completed, blocked, or repeated
 - `continue_task`: advance bounded rounds, with a default limit of 20 and a maximum of 50
 - Persistent `session_id` routing for multiple ChatGPT tabs in one browser
-- A/B can share one session; an independent task C uses another session
 - Lightweight Control Plane routes with compact status and structured events
 - Task IR and bounded executor-report compilation for brain prompts
 - Evidence-first completion checks
 
 ## Multi-tab routing
 
-Each bridge session owns one browser tab. The bridge records the DevTools `targetId` as the primary tab identity and uses the ChatGPT conversation ID from `/c/<conversation-id>` URLs for recovery and validation.
+Each bridge session owns one browser tab. The bridge records the DevTools `targetId` as the primary tab identity and uses the ChatGPT conversation ID from `/c/<conversation-id>` URLs for recovery and validation. Reuse a `session_id` when multiple tool calls should coordinate through the same tab; use a distinct `session_id` for independent work.
 
-Typical setup:
+Create or inspect sessions with `chatgpt_browser_session_create` and `chatgpt_browser_session_list`. Include the relevant `session_id` in every browser and brain-hand call. The default session remains available for compatibility.
 
-```text
-A executor + B relay: session_id = task-a
-C independent task:   session_id = task-c
-```
+## Setup
 
-Create or inspect sessions with `chatgpt_browser_session_create` and `chatgpt_browser_session_list`. Include the same `session_id` in every browser and brain-hand call. The default session remains available for compatibility.
-
-## Local setup
-
-1. Install the plugin in Codex from your local marketplace.
+1. Install the plugin in Codex through the plugin manager or a configured marketplace.
 2. Start Chrome or Edge with remote debugging enabled, or use `chatgpt_browser_launch`.
 3. Open ChatGPT Web and sign in manually.
 4. Use `chatgpt_browser_open`, then select a conversation by title, ID, or URL.
 5. Start the brain-hand loop with `brain_plan`.
 
-The MCP server entrypoint is `scripts/mcp_server.mjs`. Session routing metadata is stored locally under `%LOCALAPPDATA%\\CodexChatGPTBridge\\sessions` and is not part of this repository.
+The MCP server entrypoint is `scripts/mcp_server.mjs`. Session routing metadata is stored in the user's application data directory and is not part of this repository.
 
 ## Control Plane routes
 

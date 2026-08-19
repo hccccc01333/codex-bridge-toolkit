@@ -538,7 +538,7 @@ function resultText(result) {
 }
 
 function planPrompt(goal, constraints, context) {
-  return `You are the planning brain supervising Codex Luna, which is the local execution agent.
+  return `You are the planning brain supervising Codex Luna, which is the execution agent.
 Create the next concrete, verifiable task for Luna. Do not claim that you edited files or ran commands.
 Use only the supplied context. Return JSON only, with this shape:
 {"status":"continue","task":"one concrete next task","constraints":["..."],"acceptance":["..."],"evidence":["..."],"reason":"brief explanation"}
@@ -556,7 +556,7 @@ ${clip(context || "No execution has started.")}`;
 
 function reportPrompt(report) {
   return `The Codex Luna executor has submitted the following execution report.
-Record it as external evidence. Do not invent local changes, and do not provide a long analysis yet.
+Record it as external evidence. Do not invent changes, and do not provide a long analysis yet.
 Reply with a concise acknowledgement and one important question only if required.
 
 GOAL:
@@ -1331,7 +1331,7 @@ const TOOLS = [
     name: "chatgpt_browser_session_create",
     description: "Create a persistent bridge session that owns one ChatGPT browser tab. Use a different session_id for each independent task; do not delete sessions through the bridge.",
     inputSchema: { type: "object", properties: {
-      session_id: { type: "string", description: "Stable task/session key, for example task-a or task-c." },
+      session_id: { type: "string", description: "Stable task/session key, for example project-alpha or project-beta." },
       name: { type: "string", description: "Human-readable session name." },
     }, required: ["session_id"] },
   },
@@ -1385,7 +1385,7 @@ const TOOLS = [
   },
   {
     name: "brain_plan",
-    description: "Start or reset the brain-hand mode. Ask ChatGPT Web to produce one concrete, verifiable next task for Codex Luna. The web model plans; Luna executes locally.",
+    description: "Start or reset the brain-hand mode. Ask ChatGPT Web to produce one concrete, verifiable next task for Codex Luna. The web model plans; Luna executes in the connected workspace.",
     inputSchema: { type: "object", properties: {
       goal: { type: "string" },
       context: { type: "string" },
@@ -1462,7 +1462,7 @@ for (const tool of TOOLS) {
   tool.inputSchema.properties.session_id = {
     type: "string",
     default: DEFAULT_SESSION_ID,
-    description: "Persistent bridge session key. Sessions own separate ChatGPT browser tabs; A/B can share one key, C should use another.",
+    description: "Persistent bridge session key. Reuse one key when related tool calls should share a ChatGPT browser tab; use a distinct key for independent work.",
   };
 }
 

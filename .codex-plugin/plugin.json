@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-web-bridge",
-  "version": "0.1.0+codex.20260819100751",
+  "version": "0.1.0+codex.20260819130814",
   "description": "A local MCP bridge for visible ChatGPT Web communication and brain-hand orchestration, where ChatGPT Web plans and reviews while Codex Luna executes locally.",
   "author": {
     "name": "Local developer"
