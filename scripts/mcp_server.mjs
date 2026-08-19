@@ -6,6 +6,28 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { createHash } from "node:crypto";
+import {
+  DEFAULT_ROUTE_ID,
+  appendRouteEvent,
+  enqueueRouteAction,
+  enqueueRouteEvent,
+  listRoutes,
+  newRouteRecord,
+  normalizeRouteId,
+  readRoute,
+  routeIdOf,
+  routeQueueState,
+  routeSummary,
+  updateRoute,
+  writeRoute,
+} from "./control_plane.mjs";
+import {
+  compactExecutorReport,
+  compileProtocolMessage,
+  completionProof,
+  enforceEvidenceFirst,
+  taskIRFromArgs,
+} from "./protocol.mjs";
 
 const DEFAULT_PORT = 9222;
 const CHATGPT_URL = "https://chatgpt.com/";
@@ -25,11 +47,14 @@ let selectedConversation = null;
 let activeTargetId = null;
 let activeSessionId = DEFAULT_SESSION_ID;
 let activeSession = null;
+let activeRouteId = DEFAULT_ROUTE_ID;
+let activeRoute = null;
 
 function newBrainState() {
   return {
     mode: "brain-hand",
     goal: "",
+    taskIR: null,
     constraints: [],
     maxRounds: DEFAULT_MAX_ROUNDS,
     round: 0,
@@ -111,9 +136,7 @@ function activateSession(args = {}) {
 }
 
 function ensureActiveSession(args = {}) {
-  const id = sessionIdOf(args);
-  if (!activeSession || activeSessionId !== id) return activateSession({ ...args, session_id: id });
-  return activeSession;
+  return ensureActiveRoute(args);
 }
 
 function persistActiveSession() {
@@ -123,6 +146,7 @@ function persistActiveSession() {
   if (activeTargetId) activeSession.target_id = activeTargetId;
   if (target?.url) activeSession.target_url = target.url;
   writeSession(activeSession);
+  if (activeRoute) syncActiveRoute();
 }
 
 function sessionSummary(session) {
@@ -177,6 +201,169 @@ function listSessions() {
   return jsonResult("stored bridge sessions", {
     active_session_id: activeSessionId,
     sessions: listStoredSessions(),
+  });
+}
+
+function routeSessionIdOf(args = {}, route = null) {
+  const explicitSession = args.session_id ?? args.sessionId;
+  return normalizeSessionId(explicitSession || route?.session_id || route?.route_id || DEFAULT_SESSION_ID);
+}
+
+function routeBrainSummary() {
+  return {
+    round: brainState.round || 0,
+    status: brainState.latestReview?.status || (brainState.goal ? "running" : "idle"),
+    task: brainState.latestPlan?.task || null,
+    report: brainState.latestReport ? {
+      status: brainState.latestReport.status || null,
+      changes: brainState.latestReport.changes || [],
+      tests: brainState.latestReport.tests || [],
+      blockers: brainState.latestReport.blockers || [],
+      evidence: brainState.latestReport.evidence || [],
+    } : null,
+    review: brainState.latestReview ? {
+      status: brainState.latestReview.status || null,
+      task: brainState.latestReview.task || null,
+      reason: brainState.latestReview.reason || null,
+    } : null,
+  };
+}
+
+function derivedRouteStatus() {
+  if (activeRoute?.status === "paused") return "paused";
+  const terminal = activeRoute?.latest_review?.status || brainState.latestReview?.status || brainState.latestPlan?.status;
+  if (["completed", "blocked", "repeated", "max_rounds"].includes(terminal)) return terminal;
+  return brainState.goal ? "running" : "idle";
+}
+
+function syncActiveRoute(extra = {}) {
+  if (!activeRoute) return;
+  activeRoute = writeRoute({
+    ...activeRoute,
+    ...extra,
+    route_id: activeRouteId,
+    session_id: activeSessionId,
+    target_id: activeSession?.target_id || activeTargetId || null,
+    conversation_id: activeSession?.conversation?.id || selectedConversation?.id || null,
+    round: brainState.round || 0,
+    status: extra.status || derivedRouteStatus(),
+    latest_task: brainState.latestPlan?.task || activeRoute.latest_task || null,
+    latest_report: routeBrainSummary().report,
+    latest_review: routeBrainSummary().review,
+  });
+}
+
+function activateRoute(args = {}) {
+  const id = routeIdOf(args);
+  const explicitRoute = args.route_id ?? args.routeId;
+  let route = readRoute(id);
+  const sessionId = routeSessionIdOf(args, route);
+  if (explicitRoute && route.session_id !== sessionId) {
+    route = writeRoute({ ...route, session_id: sessionId });
+  }
+  activeRouteId = id;
+  activeRoute = route;
+  activateSession({ ...args, session_id: sessionId });
+  syncActiveRoute();
+  return activeRoute;
+}
+
+function ensureActiveRoute(args = {}) {
+  const id = routeIdOf(args);
+  if (!activeRoute || activeRouteId !== id) return activateRoute(args);
+  return activeRoute;
+}
+
+function routeCreate(args = {}) {
+  const rawId = args.route_id ?? args.routeId;
+  if (!String(rawId || "").trim()) return jsonResult("route_id is required when creating a route", { created: false }, true);
+  let id;
+  try { id = normalizeRouteId(rawId); }
+  catch (error) { return jsonResult(String(error), { created: false }, true); }
+  try {
+    const existing = readRoute(id, { create: false });
+    return jsonResult(`route already exists: ${id}`, { created: false, route: routeSummary(existing) }, true);
+  } catch (error) {
+    if (error?.code !== "ENOENT") return jsonResult(String(error), { created: false }, true);
+  }
+  const sessionId = routeSessionIdOf(args, { route_id: id });
+  const session = readSession(sessionId);
+  const route = newRouteRecord(id, {
+    name: args.name,
+    codex_thread_id: args.codex_thread_id ?? args.codexThreadId,
+    session_id: sessionId,
+    target_id: session.target_id,
+    conversation_id: session.conversation?.id,
+  });
+  writeRoute(route);
+  return jsonResult(`route created: ${id}`, { created: true, route: routeSummary(route) });
+}
+
+function routeList() {
+  return jsonResult("stored control-plane routes", {
+    active_route_id: activeRouteId,
+    routes: listRoutes().map(routeSummary),
+  });
+}
+
+function routeStatus(args = {}) {
+  const id = routeIdOf(args);
+  const route = readRoute(id);
+  let session = null;
+  try { session = readSession(route.session_id, false); } catch {}
+  return jsonResult(`route status: ${id}`, {
+    route: routeSummary(route),
+    session: session ? sessionSummary(session) : null,
+    queue_runtime: routeQueueState(id),
+    events: (route.events || []).slice(-20),
+  });
+}
+
+function routeBind(args = {}) {
+  const id = routeIdOf(args);
+  let route;
+  try { route = readRoute(id, { create: false }); }
+  catch (error) { return jsonResult(`route does not exist: ${id}`, { bound: false }, true); }
+  const sessionId = args.session_id || args.sessionId || route.session_id;
+  const session = readSession(sessionId);
+  route = writeRoute({
+    ...route,
+    name: args.name || route.name,
+    codex_thread_id: args.codex_thread_id ?? args.codexThreadId ?? route.codex_thread_id,
+    session_id: session.session_id,
+    target_id: args.target_id ?? args.targetId ?? session.target_id ?? route.target_id,
+    conversation_id: args.conversation_id ?? args.conversationId ?? session.conversation?.id ?? route.conversation_id,
+  });
+  route = appendRouteEvent(id, { type: "ROUTE_BOUND", summary: `bound route to session ${session.session_id}` });
+  return jsonResult(`route bound: ${id}`, { bound: true, route: routeSummary(route) });
+}
+
+function routePause(args = {}) {
+  const id = routeIdOf(args);
+  let route = updateRoute(id, { status: "paused", last_action: "route_pause" });
+  route = appendRouteEvent(id, { type: "PAUSED", summary: args.reason || "route paused" });
+  return jsonResult(`route paused: ${id}`, { paused: true, route: routeSummary(route) });
+}
+
+function routeResume(args = {}) {
+  const id = routeIdOf(args);
+  let route = updateRoute(id, { status: "idle", last_action: "route_resume" });
+  route = appendRouteEvent(id, { type: "RESUMED", summary: args.reason || "route resumed" });
+  return jsonResult(`route resumed: ${id}`, { resumed: true, route: routeSummary(route) });
+}
+
+function routeEvent(args = {}) {
+  const id = routeIdOf(args);
+  const message = compileProtocolMessage(args.type || args.event_type || "EVENT", {
+    summary: args.summary,
+    message: args.message,
+    data: args.data,
+  });
+  const event = enqueueRouteEvent(id, message);
+  return jsonResult(`route event queued: ${id}`, {
+    queued: true,
+    route: routeSummary(event),
+    event: event.queue?.last_event || null,
   });
 }
 
@@ -326,14 +513,18 @@ function recordReport(report) {
 
 function brainStateView() {
   return {
+    route_id: activeRouteId,
     session_id: activeSessionId,
+    codex_thread_id: activeRoute?.codex_thread_id || null,
     mode: brainState.mode,
     goal: brainState.goal,
+    task_ir: brainState.taskIR,
     constraints: brainState.constraints,
     round: brainState.round,
     max_rounds: brainState.maxRounds,
     latest_plan: brainState.latestPlan,
     latest_report: brainState.latestReport,
+    completion_proof: brainState.latestReport ? completionProof(brainState.latestReport) : null,
     latest_review: brainState.latestReview,
     conversation: selectedConversation,
     browser_target_id: activeSession?.target_id || null,
@@ -384,12 +575,16 @@ Decide whether the task is completed, blocked, repeated, or should continue.
 Return JSON only, with this shape:
 {"status":"continue|completed|blocked|repeated","next_task":"one concrete next task or empty","constraints":["..."],"acceptance":["..."],"evidence":["..."],"reason":"brief decision reason"}
 Use completed only when the acceptance criteria are actually met. Use blocked when Luna cannot proceed without missing information or approval. Use repeated when the same action/result is looping without new evidence.
+Completion must be evidence-first: a completed decision requires at least one structured test or evidence item in the executor report. If proof is missing, return blocked and explain what evidence is required.
 
 GOAL:
 ${clip(brainState.goal)}
 
 CURRENT PLAN:
 ${clip(JSON.stringify(brainState.latestPlan || {}, null, 2))}
+
+TASK IR:
+${clip(JSON.stringify(brainState.taskIR || {}, null, 2))}
 
 LATEST EXECUTOR REPORT:
 ${clip(report)}
@@ -401,7 +596,7 @@ ${clip(JSON.stringify(brainState.latestReview || {}, null, 2))}`;
 function normalizeReport(args = {}) {
   const raw = firstNonEmpty(args.report, args.executor_report, args.result, args.summary);
   const reportObject = raw ? findJsonObject(raw) : null;
-  return {
+  return compactExecutorReport({
     round: Number.isInteger(Number(args.round)) ? Number(args.round) : brainState.round,
     status: firstNonEmpty(args.status, reportObject?.status) || "reported",
     report: clip(raw || JSON.stringify({
@@ -414,11 +609,11 @@ function normalizeReport(args = {}) {
     tests: stringList(args.tests ?? reportObject?.tests),
     blockers: stringList(args.blockers ?? reportObject?.blockers),
     evidence: stringList(args.evidence ?? reportObject?.evidence),
-  };
+  });
 }
 
 async function brainPlan(args = {}) {
-  activateSession(args);
+  activateRoute(args);
   const goal = clip(args.goal);
   if (!goal.trim()) return jsonResult("goal is required", { planned: false }, true);
   brainState = newBrainState();
@@ -426,7 +621,8 @@ async function brainPlan(args = {}) {
   brainState.constraints = stringList(args.constraints);
   brainState.maxRounds = maxRoundsOf(args.max_rounds);
   brainState.startedAt = new Date().toISOString();
-  const prompt = planPrompt(goal, brainState.constraints, args.context);
+  brainState.taskIR = taskIRFromArgs({ ...args, goal, constraints: brainState.constraints });
+  const prompt = planPrompt(goal, brainState.constraints, JSON.stringify(brainState.taskIR, null, 2));
   const result = await askChatGPT({ ...args, port: args.port, timeout_ms: args.timeout_ms, prompt });
   if (result.isError) return result;
   const rawReply = resultText(result);
@@ -452,7 +648,7 @@ async function brainPlan(args = {}) {
 }
 
 async function executorReport(args = {}) {
-  activateSession(args);
+  activateRoute(args);
   if (!brainState.goal) return jsonResult("call brain_plan before executor_report", { reported: false }, true);
   const report = normalizeReport(args);
   if (!report.report.trim() || report.report === "{}") {
@@ -474,7 +670,7 @@ async function executorReport(args = {}) {
 }
 
 async function brainReview(args = {}) {
-  activateSession(args);
+  activateRoute(args);
   if (!brainState.goal) return jsonResult("call brain_plan before brain_review", { reviewed: false }, true);
   if (args.report || args.result || args.summary || args.changes || args.tests || args.blockers || args.evidence) {
     brainState.latestReport = normalizeReport(args);
@@ -497,7 +693,10 @@ async function brainReview(args = {}) {
     decision.status = "repeated";
     decision.reason = decision.reason || "the same plan/report decision repeated without new evidence";
   }
-  brainState.latestReview = { round: brainState.round, ...decision, repeated_detected: repeated };
+  const evidenceResult = enforceEvidenceFirst(decision, brainState.latestReport);
+  const finalDecision = evidenceResult.decision;
+  const proof = evidenceResult.proof;
+  brainState.latestReview = { round: brainState.round, ...finalDecision, repeated_detected: repeated, completion_proof: proof };
   persistActiveSession();
   return jsonResult(`brain review: ${brainState.latestReview.status}`, {
     reviewed: true,
@@ -509,12 +708,13 @@ async function brainReview(args = {}) {
     evidence: brainState.latestReview.evidence,
     reason: brainState.latestReview.reason,
     repeated_detected: repeated,
+    completion_proof: proof,
     raw_reply: rawReply,
   });
 }
 
 async function continueTask(args = {}) {
-  activateSession(args);
+  activateRoute(args);
   if (!brainState.goal) return jsonResult("call brain_plan before continue_task", { continued: false }, true);
   if (args.max_rounds !== undefined) brainState.maxRounds = maxRoundsOf(args.max_rounds);
   if (args.executor_report || args.result || args.summary || args.changes || args.tests || args.blockers || args.evidence) {
@@ -568,12 +768,12 @@ async function continueTask(args = {}) {
 }
 
 function brainStatus(args = {}) {
-  activateSession(args);
+  activateRoute(args);
   return jsonResult("brain-hand state", brainStateView());
 }
 
 function brainReset(args = {}) {
-  activateSession(args);
+  activateRoute(args);
   brainState = newBrainState();
   persistActiveSession();
   return jsonResult("brain-hand state reset", brainStateView());
@@ -781,7 +981,7 @@ async function visibleConversations(query = "") {
 }
 
 async function listConversations(args = {}) {
-  activateSession(args);
+  activateRoute(args);
   const port = portOf(args);
   try {
     await ensureConnected(port, activeSession);
@@ -802,7 +1002,7 @@ async function listConversations(args = {}) {
 }
 
 async function selectConversation(args = {}) {
-  activateSession(args);
+  activateRoute(args);
   const port = portOf(args);
   if (brainState.goal && !args.force) {
     return jsonResult("an active brain-hand task exists; call brain_reset or pass force=true before switching conversations", {
@@ -859,7 +1059,7 @@ async function selectConversation(args = {}) {
 }
 
 async function currentConversation(args = {}) {
-  activateSession(args);
+  activateRoute(args);
   const port = portOf(args);
   try {
     await ensureConnected(port, activeSession);
@@ -918,13 +1118,15 @@ function launchBrowser(args = {}) {
 }
 
 async function browserStatus(args = {}) {
-  activateSession(args);
+  activateRoute(args);
   const port = portOf(args);
   try {
     const targets = await listTargets(port);
     return jsonResult("browser is reachable", {
       connected: Boolean(socket && socket.readyState === WebSocket.OPEN),
       port,
+      route_id: activeRouteId,
+      route_status: activeRoute?.status || "idle",
       session_id: activeSessionId,
       assigned_target_id: activeSession?.target_id || null,
       assigned_conversation_id: activeSession?.conversation?.id || null,
@@ -935,12 +1137,15 @@ async function browserStatus(args = {}) {
         url: item.url,
         conversation_id: conversationIdFromUrl(item.url || ""),
         claimed_by_session: listStoredSessions().find(session => session.target_id === item.id)?.session_id || null,
+        claimed_by_route: listRoutes().find(route => route.target_id === item.id)?.route_id || null,
       })),
     });
   } catch (error) {
     return jsonResult("browser is not reachable; launch the dedicated browser first", {
       connected: false,
       port,
+      route_id: activeRouteId,
+      route_status: activeRoute?.status || "idle",
       session_id: activeSessionId,
       error: String(error),
       launch: `chatgpt_browser_launch with port ${port}`,
@@ -949,7 +1154,7 @@ async function browserStatus(args = {}) {
 }
 
 async function openChatGPT(args = {}) {
-  activateSession(args);
+  activateRoute(args);
   const port = portOf(args);
   let page;
   try {
@@ -1068,6 +1273,60 @@ async function askChatGPT(args = {}) {
 }
 
 const TOOLS = [
+  {
+    name: "bridge_route_create",
+    description: "Create a lightweight Control Plane route that maps one Codex executor thread to one ChatGPT Web session/tab. This does not drive Codex threads automatically.",
+    inputSchema: { type: "object", properties: {
+      route_id: { type: "string", description: "Stable route key, for example pokemon-rl." },
+      name: { type: "string" },
+      codex_thread_id: { type: "string", description: "Optional Codex Thread ID for Control Plane metadata." },
+      session_id: { type: "string", description: "ChatGPT bridge session to bind to this route." },
+    }, required: ["route_id"] },
+  },
+  {
+    name: "bridge_route_list",
+    description: "List compact route metadata for the Control Plane without loading full task histories.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "bridge_route_status",
+    description: "Inspect one route's compact state, queue counters, latest plan/report/review, and recent protocol events.",
+    inputSchema: { type: "object", properties: { route_id: { type: "string" } }, required: ["route_id"] },
+  },
+  {
+    name: "bridge_route_bind",
+    description: "Bind or update a route's Codex thread, ChatGPT session, target tab, and conversation metadata.",
+    inputSchema: { type: "object", properties: {
+      route_id: { type: "string" },
+      name: { type: "string" },
+      codex_thread_id: { type: "string" },
+      session_id: { type: "string" },
+      target_id: { type: "string" },
+      conversation_id: { type: "string" },
+    }, required: ["route_id"] },
+  },
+  {
+    name: "bridge_route_pause",
+    description: "Pause a route. Queued route actions will wait until the route is resumed; an already-running browser request is not forcibly interrupted.",
+    inputSchema: { type: "object", properties: { route_id: { type: "string" }, reason: { type: "string" } }, required: ["route_id"] },
+  },
+  {
+    name: "bridge_route_resume",
+    description: "Resume a paused route so its queued actions may continue.",
+    inputSchema: { type: "object", properties: { route_id: { type: "string" }, reason: { type: "string" } }, required: ["route_id"] },
+  },
+  {
+    name: "bridge_route_event",
+    description: "Append a structured protocol event to a route queue. Supported event types include TASK, RESULT, EVIDENCE, QUESTION, REVIEW, BLOCKED, and COMPLETED.",
+    inputSchema: { type: "object", properties: {
+      route_id: { type: "string" },
+      type: { type: "string" },
+      event_type: { type: "string" },
+      summary: { type: "string" },
+      message: { type: "string" },
+      data: { type: "object" },
+    }, required: ["route_id"] },
+  },
   {
     name: "chatgpt_browser_session_create",
     description: "Create a persistent bridge session that owns one ChatGPT browser tab. Use a different session_id for each independent task; do not delete sessions through the bridge.",
@@ -1199,7 +1458,7 @@ const TOOLS = [
 ];
 
 for (const tool of TOOLS) {
-  if (!tool.inputSchema?.properties || tool.name.includes("session_")) continue;
+  if (!tool.inputSchema?.properties || tool.name.includes("session_") || tool.name.startsWith("bridge_route_")) continue;
   tool.inputSchema.properties.session_id = {
     type: "string",
     default: DEFAULT_SESSION_ID,
@@ -1207,7 +1466,29 @@ for (const tool of TOOLS) {
   };
 }
 
-async function callTool(name, args) {
+const ROUTED_TOOLS = new Set([
+  "chatgpt_browser_status",
+  "chatgpt_browser_open",
+  "chatgpt_browser_list_conversations",
+  "chatgpt_browser_select_conversation",
+  "chatgpt_browser_current_conversation",
+  "chatgpt_browser_ask",
+  "brain_plan",
+  "executor_report",
+  "brain_review",
+  "continue_task",
+  "brain_status",
+  "brain_reset",
+]);
+
+async function callToolDirect(name, args) {
+  if (name === "bridge_route_create") return routeCreate(args);
+  if (name === "bridge_route_list") return routeList();
+  if (name === "bridge_route_status") return routeStatus(args);
+  if (name === "bridge_route_bind") return routeBind(args);
+  if (name === "bridge_route_pause") return routePause(args);
+  if (name === "bridge_route_resume") return routeResume(args);
+  if (name === "bridge_route_event") return routeEvent(args);
   if (name === "chatgpt_browser_session_create") return createSession(args);
   if (name === "chatgpt_browser_session_list") return listSessions();
   if (name === "chatgpt_browser_launch") return jsonResult("dedicated browser launched; sign in manually", launchBrowser(args));
@@ -1224,6 +1505,21 @@ async function callTool(name, args) {
   if (name === "brain_status") return brainStatus(args);
   if (name === "brain_reset") return brainReset(args);
   return jsonResult(`unknown tool: ${name}`, undefined, true);
+}
+
+async function callTool(name, args) {
+  if (!ROUTED_TOOLS.has(name)) return callToolDirect(name, args);
+  let routeId;
+  try { routeId = routeIdOf(args); }
+  catch (error) { return jsonResult(String(error), { route_id: null }, true); }
+  enqueueRouteEvent(routeId, { type: "ACTION_QUEUED", summary: name });
+  try {
+    return await enqueueRouteAction(routeId, name, () => callToolDirect(name, args), {
+      allowPaused: name === "brain_reset",
+    });
+  } catch (error) {
+    return jsonResult(String(error), { route_id: routeId, queued: false }, true);
+  }
 }
 
 async function handle(message) {

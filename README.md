@@ -12,6 +12,9 @@ The bridge uses Chrome DevTools Protocol against a user-visible Chrome or Edge w
 - `continue_task`: advance bounded rounds, with a default limit of 20 and a maximum of 50
 - Persistent `session_id` routing for multiple ChatGPT tabs in one browser
 - A/B can share one session; an independent task C uses another session
+- Lightweight Control Plane routes with compact status and structured events
+- Task IR and bounded executor-report compilation for brain prompts
+- Evidence-first completion checks
 
 ## Multi-tab routing
 
@@ -35,6 +38,26 @@ Create or inspect sessions with `chatgpt_browser_session_create` and `chatgpt_br
 5. Start the brain-hand loop with `brain_plan`.
 
 The MCP server entrypoint is `scripts/mcp_server.mjs`. Session routing metadata is stored locally under `%LOCALAPPDATA%\\CodexChatGPTBridge\\sessions` and is not part of this repository.
+
+## Control Plane routes
+
+For multi-agent use, a route is the stable mapping between one executor thread and one brain session:
+
+```text
+route_id
+  ├── codex_thread_id   (metadata; no automatic Codex App Server control yet)
+  └── session_id
+        ├── browser target/tab
+        └── ChatGPT conversation
+```
+
+The `bridge_route_*` tools create, bind, inspect, pause, resume, and append structured events to routes. Brain-hand and browser actions with the same `route_id` are serialized by a per-route queue. Route state is compact and stored under `%LOCALAPPDATA%\\CodexChatGPTBridge\\routes`; full ChatGPT and Codex histories remain in their respective agents rather than in a central conversation.
+
+The current Control Plane is deliberately metadata-first: it does not pretend to drive Codex Thread turns or to run an autonomous worker. A future Codex adapter can use `codex_thread_id` and the route event protocol without changing the ChatGPT Web adapter.
+
+## Protocol and evidence
+
+`scripts/protocol.mjs` defines the first internal protocol layer. It compiles plan inputs into a bounded Task IR, limits report fields before they are sent to ChatGPT Web, and requires at least one structured test or evidence item before a review can remain `completed`. This is a foundation for future provider-specific prompt compilers, trace/replay, and benchmark evaluation.
 
 ## Validation
 
