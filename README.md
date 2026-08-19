@@ -51,6 +51,26 @@ The current Control Plane is deliberately metadata-first: it does not pretend to
 
 `scripts/protocol.mjs` defines the first internal protocol layer. It compiles plan inputs into a bounded Task IR, limits report fields before they are sent to ChatGPT Web, and requires at least one structured test or evidence item before a review can remain `completed`. This is a foundation for future provider-specific prompt compilers, trace/replay, and benchmark evaluation.
 
+## Control Plane routes
+
+For multi-agent use, a route is the stable mapping between one executor thread and one brain session:
+
+```text
+route_id
+  ├── codex_thread_id   (metadata; no automatic Codex App Server control yet)
+  └── session_id
+        ├── browser target/tab
+        └── ChatGPT conversation
+```
+
+The `bridge_route_*` tools create, bind, inspect, pause, resume, and append structured events to routes. Brain-hand and browser actions with the same `route_id` are serialized by a per-route queue. Route state is compact and stored under `%LOCALAPPDATA%\\CodexChatGPTBridge\\routes`; full ChatGPT and Codex histories remain in their respective agents rather than in a central conversation.
+
+The current Control Plane is deliberately metadata-first: it does not pretend to drive Codex Thread turns or to run an autonomous worker. A future Codex adapter can use `codex_thread_id` and the route event protocol without changing the ChatGPT Web adapter.
+
+## Protocol and evidence
+
+`scripts/protocol.mjs` defines the first internal protocol layer. It compiles plan inputs into a bounded Task IR, limits report fields before they are sent to ChatGPT Web, and requires at least one structured test or evidence item before a review can remain `completed`. This is a foundation for future provider-specific prompt compilers, trace/replay, and benchmark evaluation.
+
 ## Validation
 
 ```powershell
