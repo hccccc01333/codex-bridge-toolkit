@@ -5,7 +5,6 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
-import { createHash } from "node:crypto";
 import {
   DEFAULT_ROUTE_ID,
   appendRouteEvent,
@@ -22,20 +21,45 @@ import {
   writeRoute,
 } from "./control_plane.mjs";
 import {
-  compactExecutorReport,
   compileProtocolMessage,
   completionProof,
   enforceEvidenceFirst,
   taskIRFromArgs,
 } from "./protocol.mjs";
+import {
+  DEFAULT_MAX_ROUNDS as STOP_DEFAULT_MAX_ROUNDS,
+  HARD_MAX_ROUNDS as STOP_HARD_MAX_ROUNDS,
+  detectRepeated,
+  fingerprint,
+  maxRoundsOf as stopMaxRoundsOf,
+  roundLimitReached,
+} from "../src/orchestration/stop_policy.mjs";
+import {
+  conversationIdFromUrl,
+  safeConversationUrl,
+} from "../src/browser/conversation_router.mjs";
+import { SELECTOR_STRATEGIES, selectorHealthScript } from "../src/browser/selectors.mjs";
+import { createCodexAdapter } from "../src/adapters/codex.mjs";
+import {
+  clip as brainClip,
+  decisionFromReply,
+  firstNonEmpty,
+  newBrainState as createBrainState,
+  normalizeReport as normalizeBrainReport,
+  planPrompt,
+  recordReport as recordBrainReport,
+  recordTask as recordBrainTask,
+  reportPrompt,
+  reviewPrompt,
+  stringList as brainStringList,
+} from "../src/orchestration/brain_hand.mjs";
 
 const DEFAULT_PORT = 9222;
 const CHATGPT_URL = "https://chatgpt.com/";
 const SERVER_NAME = "chatgpt-web-bridge";
 const SERVER_VERSION = "0.1.0";
-const DEFAULT_MAX_ROUNDS = 20;
-const HARD_MAX_ROUNDS = 50;
-const MAX_CONTEXT_CHARS = 24000;
+const DEFAULT_MAX_ROUNDS = STOP_DEFAULT_MAX_ROUNDS;
+const HARD_MAX_ROUNDS = STOP_HARD_MAX_ROUNDS;
 const DEFAULT_SESSION_ID = "default";
 const SESSION_DIR = path.join(process.env.LOCALAPPDATA || os.homedir(), "CodexChatGPTBridge", "sessions");
 
@@ -49,27 +73,9 @@ let activeSessionId = DEFAULT_SESSION_ID;
 let activeSession = null;
 let activeRouteId = DEFAULT_ROUTE_ID;
 let activeRoute = null;
+const codexAdapters = new Map();
 
-function newBrainState() {
-  return {
-    mode: "brain-hand",
-    goal: "",
-    taskIR: null,
-    constraints: [],
-    maxRounds: DEFAULT_MAX_ROUNDS,
-    round: 0,
-    latestPlan: null,
-    latestReport: null,
-    latestReview: null,
-    seenTaskFingerprints: [],
-    seenReportFingerprints: [],
-    seenDecisionFingerprints: [],
-    lastWebReply: "",
-    startedAt: null,
-  };
-}
-
-let brainState = newBrainState();
+let brainState = createBrainState(DEFAULT_MAX_ROUNDS);
 
 function normalizeSessionId(value = DEFAULT_SESSION_ID) {
   const id = String(value || DEFAULT_SESSION_ID).trim();
@@ -367,6 +373,111 @@ function routeEvent(args = {}) {
   });
 }
 
+function codexAdapterForRoute(routeId) {
+  const id = normalizeRouteId(routeId);
+  let adapter = codexAdapters.get(id);
+  if (!adapter) {
+    adapter = createCodexAdapter({
+      cwd: process.cwd(),
+      onNotification: message => {
+        if (message.method === "turn/completed") {
+          appendRouteEvent(id, {
+            type: "CODEX_TURN_COMPLETED",
+            summary: `Codex turn completed: ${message.params?.turn?.status || "unknown"}`,
+          });
+        }
+      },
+    });
+    codexAdapters.set(id, adapter);
+  }
+  return adapter;
+}
+
+function codexAdapterStatus(args = {}) {
+  const id = routeIdOf(args);
+  const route = readRoute(id);
+  return jsonResult(`Codex Adapter status: ${id}`, {
+    adapter: codexAdapterForRoute(id).status(),
+    route: routeSummary(route),
+  });
+}
+
+async function codexThreadStart(args = {}) {
+  const route = activateRoute(args);
+  const adapter = codexAdapterForRoute(route.route_id);
+  try {
+    const result = await adapter.startThread({
+      thread_id: args.codex_thread_id || route.codex_thread_id || null,
+      cwd: args.cwd || process.cwd(),
+      model: args.model,
+      baseInstructions: args.base_instructions,
+      approvalPolicy: args.approval_policy,
+    });
+    const updated = updateRoute(route.route_id, {
+      codex_thread_id: result.thread_id,
+      status: "worker_ready",
+      last_action: "codex_thread_start",
+    });
+    appendRouteEvent(route.route_id, {
+      type: "CODEX_THREAD_READY",
+      summary: `Codex thread ready: ${result.thread_id || "unknown"}`,
+    });
+    return jsonResult(`Codex worker ready: ${route.route_id}`, {
+      started: true,
+      thread_id: result.thread_id,
+      route: routeSummary(updated),
+      adapter: adapter.status(),
+    });
+  } catch (error) {
+    return jsonResult(String(error), { started: false, route_id: route.route_id, code: error.code || "CODEX_ADAPTER_ERROR" }, true);
+  }
+}
+
+async function codexThreadTurn(args = {}) {
+  const route = activateRoute(args);
+  const threadId = args.codex_thread_id || route.codex_thread_id;
+  if (!threadId) return jsonResult("codex_thread_id is required; call codex_thread_start first", { sent: false }, true);
+  try {
+    const result = await codexAdapterForRoute(route.route_id).sendTask({
+      thread_id: threadId,
+      text: args.text || args.task || args.prompt,
+      input: args.input,
+      timeoutMs: args.timeout_ms,
+      cwd: args.cwd,
+      model: args.model,
+      effort: args.effort,
+    });
+    const updated = updateRoute(route.route_id, {
+      codex_thread_id: threadId,
+      status: result.completed ? "worker_ready" : "worker_running",
+      last_action: "codex_thread_turn",
+      latest_report: result.text ? { source: "codex", text: result.text } : route.latest_report,
+    });
+    return jsonResult(`Codex worker turn completed: ${route.route_id}`, {
+      sent: true,
+      completed: result.completed,
+      thread_id: threadId,
+      turn_id: result.turn_id || result.turn?.id || null,
+      text: result.text || "",
+      route: routeSummary(updated),
+    });
+  } catch (error) {
+    return jsonResult(String(error), { sent: false, route_id: route.route_id, code: error.code || "CODEX_ADAPTER_ERROR" }, true);
+  }
+}
+
+async function codexThreadRead(args = {}) {
+  const route = activateRoute(args);
+  const threadId = args.codex_thread_id || route.codex_thread_id;
+  if (!threadId) return jsonResult("codex_thread_id is required; call codex_thread_start first", { read: false }, true);
+  try {
+    const result = await codexAdapterForRoute(route.route_id).readThread(threadId);
+    return jsonResult(`Codex thread read: ${threadId}`, { read: true, thread_id: threadId, result });
+  } catch (error) {
+    return jsonResult(String(error), { read: false, route_id: route.route_id, code: error.code || "CODEX_ADAPTER_ERROR" }, true);
+  }
+}
+
 function claimedTargetIds(excludeSessionId = "") {
   const claimed = new Set();
   for (const session of listStoredSessions()) {
@@ -381,135 +492,13 @@ function jsonResult(text, structuredContent = undefined, isError = false) {
   return result;
 }
 
-function clip(value, limit = MAX_CONTEXT_CHARS) {
-  const text = String(value ?? "");
-  return text.length <= limit ? text : `${text.slice(0, limit)}\n...[truncated]`;
-}
-
-function stringList(value) {
-  if (value === undefined || value === null || value === "") return [];
-  const values = Array.isArray(value) ? value : [value];
-  return values.map(item => String(item).trim()).filter(Boolean).slice(0, 50);
-}
-
-function maxRoundsOf(value) {
-  const parsed = Number(value ?? DEFAULT_MAX_ROUNDS);
-  if (!Number.isInteger(parsed) || parsed < 1) return DEFAULT_MAX_ROUNDS;
-  return Math.min(parsed, HARD_MAX_ROUNDS);
-}
-
-function fingerprint(value) {
-  const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
-  return createHash("sha256").update(text).digest("hex").slice(0, 16);
-}
-
-function firstNonEmpty(...values) {
-  return values.find(value => typeof value === "string" && value.trim())?.trim() || "";
-}
-
-function findJsonObject(text) {
-  const source = String(text || "");
-  const fenced = source.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidates = [fenced?.[1], source].filter(Boolean);
-  for (const candidate of candidates) {
-    try {
-      const parsed = JSON.parse(candidate.trim());
-      if (parsed && typeof parsed === "object") return parsed;
-    } catch {}
-    let start = -1;
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    for (let index = 0; index < candidate.length; index += 1) {
-      const char = candidate[index];
-      if (inString) {
-        if (escaped) escaped = false;
-        else if (char === "\\") escaped = true;
-        else if (char === '"') inString = false;
-        continue;
-      }
-      if (char === '"') {
-        inString = true;
-        continue;
-      }
-      if (char === "{") {
-        if (start < 0) start = index;
-        depth += 1;
-      } else if (char === "}" && start >= 0) {
-        depth -= 1;
-        if (depth === 0) {
-          try {
-            const parsed = JSON.parse(candidate.slice(start, index + 1));
-            if (parsed && typeof parsed === "object") return parsed;
-          } catch {}
-          start = -1;
-        }
-      }
-    }
-  }
-  return null;
-}
-
-function normalizeStatus(value, text = "") {
-  const source = String(value || text || "").toLowerCase();
-  if (/completed|complete|done|finished|success|已完成|完成/.test(source)) return "completed";
-  if (/blocked|blocker|blocked|阻塞|无法继续|被阻塞/.test(source)) return "blocked";
-  if (/repeated|repeat|loop|duplicate|重复|循环/.test(source)) return "repeated";
-  if (/max[_ -]?round|轮数上限/.test(source)) return "max_rounds";
-  return "continue";
-}
-
-function taskFromReply(parsed, rawReply) {
-  const plan = parsed?.plan && typeof parsed.plan === "object" ? parsed.plan : {};
-  const task = firstNonEmpty(
-    parsed?.next_task,
-    parsed?.nextTask,
-    parsed?.task,
-    parsed?.next_action,
-    parsed?.nextAction,
-    parsed?.action,
-    plan.next_task,
-    plan.task,
-  );
-  const acceptance = stringList(parsed?.acceptance ?? parsed?.acceptance_criteria ?? parsed?.acceptanceCriteria ?? plan.acceptance);
-  const constraints = stringList(parsed?.constraints ?? plan.constraints);
-  const evidence = stringList(parsed?.evidence ?? parsed?.required_evidence ?? parsed?.requiredEvidence ?? plan.evidence);
-  const reason = firstNonEmpty(parsed?.reason, parsed?.rationale, parsed?.summary, plan.reason);
-  return {
-    task: task || clip(rawReply, 6000),
-    acceptance,
-    constraints,
-    evidence,
-    reason,
-  };
-}
-
-function decisionFromReply(rawReply) {
-  const parsed = findJsonObject(rawReply) || {};
-  const task = taskFromReply(parsed, rawReply);
-  const status = normalizeStatus(parsed.status ?? parsed.decision ?? parsed.result, rawReply);
-  return {
-    status,
-    ...task,
-    raw_reply: clip(rawReply),
-    parsed,
-  };
-}
-
-function recordTask(task) {
-  const key = fingerprint({ task: task.task, acceptance: task.acceptance, constraints: task.constraints });
-  if (key && !brainState.seenTaskFingerprints.includes(key)) brainState.seenTaskFingerprints.push(key);
-  return key;
-}
-
-function recordReport(report) {
-  const key = fingerprint(report);
-  if (key) {
-    brainState.seenReportFingerprints.push(key);
-    if (brainState.seenReportFingerprints.length > 100) brainState.seenReportFingerprints.shift();
-  }
-  return key;
-}
+const clip = brainClip;
+const stringList = brainStringList;
+const maxRoundsOf = value => stopMaxRoundsOf(value, DEFAULT_MAX_ROUNDS);
+const newBrainState = () => createBrainState(DEFAULT_MAX_ROUNDS);
+const recordTask = task => recordBrainTask(brainState, task);
+const recordReport = report => recordBrainReport(brainState, report);
+const normalizeReport = args => normalizeBrainReport(args, brainState.round);
 
 function brainStateView() {
   return {
@@ -535,81 +524,6 @@ function brainStateView() {
 
 function resultText(result) {
   return result?.content?.find(item => item.type === "text")?.text || "";
-}
-
-function planPrompt(goal, constraints, context) {
-  return `You are the planning brain supervising Codex Luna, which is the execution agent.
-Create the next concrete, verifiable task for Luna. Do not claim that you edited files or ran commands.
-Use only the supplied context. Return JSON only, with this shape:
-{"status":"continue","task":"one concrete next task","constraints":["..."],"acceptance":["..."],"evidence":["..."],"reason":"brief explanation"}
-Allowed status values: continue, completed, blocked.
-
-GOAL:
-${clip(goal)}
-
-CONSTRAINTS:
-${JSON.stringify(constraints)}
-
-CURRENT CONTEXT:
-${clip(context || "No execution has started.")}`;
-}
-
-function reportPrompt(report) {
-  return `The Codex Luna executor has submitted the following execution report.
-Record it as external evidence. Do not invent changes, and do not provide a long analysis yet.
-Reply with a concise acknowledgement and one important question only if required.
-
-GOAL:
-${clip(brainState.goal)}
-
-ROUND: ${brainState.round}
-
-EXECUTOR REPORT:
-${clip(report)}`;
-}
-
-function reviewPrompt(reportOverride = "") {
-  const report = reportOverride || JSON.stringify(brainState.latestReport || {}, null, 2);
-  return `You are the planning brain reviewing Codex Luna's latest work.
-Decide whether the task is completed, blocked, repeated, or should continue.
-Return JSON only, with this shape:
-{"status":"continue|completed|blocked|repeated","next_task":"one concrete next task or empty","constraints":["..."],"acceptance":["..."],"evidence":["..."],"reason":"brief decision reason"}
-Use completed only when the acceptance criteria are actually met. Use blocked when Luna cannot proceed without missing information or approval. Use repeated when the same action/result is looping without new evidence.
-Completion must be evidence-first: a completed decision requires at least one structured test or evidence item in the executor report. If proof is missing, return blocked and explain what evidence is required.
-
-GOAL:
-${clip(brainState.goal)}
-
-CURRENT PLAN:
-${clip(JSON.stringify(brainState.latestPlan || {}, null, 2))}
-
-TASK IR:
-${clip(JSON.stringify(brainState.taskIR || {}, null, 2))}
-
-LATEST EXECUTOR REPORT:
-${clip(report)}
-
-PREVIOUS REVIEW:
-${clip(JSON.stringify(brainState.latestReview || {}, null, 2))}`;
-}
-
-function normalizeReport(args = {}) {
-  const raw = firstNonEmpty(args.report, args.executor_report, args.result, args.summary);
-  const reportObject = raw ? findJsonObject(raw) : null;
-  return compactExecutorReport({
-    round: Number.isInteger(Number(args.round)) ? Number(args.round) : brainState.round,
-    status: firstNonEmpty(args.status, reportObject?.status) || "reported",
-    report: clip(raw || JSON.stringify({
-      changes: stringList(args.changes),
-      tests: stringList(args.tests),
-      blockers: stringList(args.blockers),
-      evidence: stringList(args.evidence),
-    }, null, 2)),
-    changes: stringList(args.changes ?? reportObject?.changes),
-    tests: stringList(args.tests ?? reportObject?.tests),
-    blockers: stringList(args.blockers ?? reportObject?.blockers),
-    evidence: stringList(args.evidence ?? reportObject?.evidence),
-  });
 }
 
 async function brainPlan(args = {}) {
@@ -656,7 +570,12 @@ async function executorReport(args = {}) {
   }
   brainState.latestReport = report;
   recordReport(report);
-  const result = await askChatGPT({ ...args, port: args.port, timeout_ms: args.timeout_ms, prompt: reportPrompt(JSON.stringify(report, null, 2)) });
+  const result = await askChatGPT({
+    ...args,
+    port: args.port,
+    timeout_ms: args.timeout_ms,
+    prompt: reportPrompt(brainState.goal, brainState.round, JSON.stringify(report, null, 2)),
+  });
   if (result.isError) return result;
   const acknowledgement = resultText(result);
   brainState.lastWebReply = acknowledgement;
@@ -677,18 +596,33 @@ async function brainReview(args = {}) {
     recordReport(brainState.latestReport);
   }
   if (!brainState.latestReport) return jsonResult("executor report is required before brain_review", { reviewed: false }, true);
-  const result = await askChatGPT({ ...args, port: args.port, timeout_ms: args.timeout_ms, prompt: reviewPrompt() });
+  const result = await askChatGPT({
+    ...args,
+    port: args.port,
+    timeout_ms: args.timeout_ms,
+    prompt: reviewPrompt({
+      goal: brainState.goal,
+      latestPlan: brainState.latestPlan,
+      taskIR: brainState.taskIR,
+      latestReport: brainState.latestReport,
+      latestReview: brainState.latestReview,
+    }),
+  });
   if (result.isError) return result;
   const rawReply = resultText(result);
   brainState.lastWebReply = rawReply;
   const decision = decisionFromReply(rawReply);
-  const decisionKey = fingerprint({ status: decision.status, task: decision.task, acceptance: decision.acceptance, reason: decision.reason });
   const reportKey = fingerprint(brainState.latestReport);
-  const repeated = decision.status === "continue" && (
-    brainState.seenDecisionFingerprints.includes(decisionKey)
-    || (reportKey && brainState.seenReportFingerprints.filter(key => key === reportKey).length > 1)
-  );
-  if (!brainState.seenDecisionFingerprints.includes(decisionKey)) brainState.seenDecisionFingerprints.push(decisionKey);
+  const repeatResult = detectRepeated({
+    decision,
+    decisionHistory: brainState.seenDecisionFingerprints,
+    reportFingerprint: reportKey,
+    reportHistory: brainState.seenReportFingerprints,
+  });
+  const repeated = decision.status === "continue" && repeatResult.repeated;
+  if (!brainState.seenDecisionFingerprints.includes(repeatResult.decision_key)) {
+    brainState.seenDecisionFingerprints.push(repeatResult.decision_key);
+  }
   if (repeated) {
     decision.status = "repeated";
     decision.reason = decision.reason || "the same plan/report decision repeated without new evidence";
@@ -736,7 +670,7 @@ async function continueTask(args = {}) {
       state: brainStateView(),
     });
   }
-  if (brainState.round >= brainState.maxRounds - 1) {
+  if (roundLimitReached(brainState.round, brainState.maxRounds)) {
     brainState.latestReview.status = "max_rounds";
     persistActiveSession();
     return jsonResult(`task stopped: max rounds ${brainState.maxRounds}`, {
@@ -930,27 +864,6 @@ async function ensureConnected(port, session = activeSession) {
     session.target_url = page.url || null;
     persistActiveSession();
   }
-}
-
-function conversationIdFromUrl(rawUrl) {
-  try {
-    const url = new URL(rawUrl);
-    const match = url.pathname.match(/^\/c\/([^/]+)/i);
-    return match?.[1] || null;
-  } catch {
-    return null;
-  }
-}
-
-function safeConversationUrl(rawUrlOrId) {
-  const value = String(rawUrlOrId || "").trim();
-  if (!value) return null;
-  if (/^[A-Za-z0-9_-]{8,}$/.test(value)) return `${CHATGPT_URL}c/${value}`;
-  let url;
-  try { url = new URL(value); } catch { return null; }
-  if (!/^(chatgpt\.com|www\.chatgpt\.com)$/i.test(url.hostname)) return null;
-  if (!/^\/c\/[A-Za-z0-9_-]+$/i.test(url.pathname)) return null;
-  return `https://chatgpt.com${url.pathname}`;
 }
 
 async function currentConversationData() {
@@ -1153,6 +1066,23 @@ async function browserStatus(args = {}) {
   }
 }
 
+async function browserHealth(args = {}) {
+  const port = portOf(args);
+  try {
+    ensureActiveSession(args);
+    await ensureConnected(port, activeSession);
+    const health = await evaluate(selectorHealthScript());
+    return jsonResult(`ChatGPT Web adapter health: ${health?.ok ? "ok" : "degraded"}`, {
+      healthy: Boolean(health?.ok),
+      session_id: activeSessionId,
+      browser_target_id: activeSession?.target_id || null,
+      strategies: health?.strategies || [],
+    }, !health?.ok);
+  } catch (error) {
+    return jsonResult(String(error), { healthy: false, session_id: activeSessionId, port }, true);
+  }
+}
+
 async function openChatGPT(args = {}) {
   activateRoute(args);
   const port = portOf(args);
@@ -1221,11 +1151,11 @@ async function askChatGPT(args = {}) {
       return jsonResult("ChatGPT Web requires manual sign-in in the dedicated browser", { sent: false, url: before.url }, true);
     }
     const promptLiteral = JSON.stringify(prompt);
+    const inputSelectorsLiteral = JSON.stringify(SELECTOR_STRATEGIES.map(strategy => strategy.input));
     const prepared = await evaluate(`(() => {
       const value = ${promptLiteral};
-      const input = document.querySelector('[contenteditable="true"][role="textbox"]')
-        || document.querySelector('textarea:not([disabled])')
-        || document.querySelector('[contenteditable="true"]');
+      const selectors = ${inputSelectorsLiteral};
+      const input = selectors.map(selector => document.querySelector(selector)).find(Boolean);
       if (!input) return { ok: false, reason: 'input-not-found' };
       input.focus();
       return { ok: true, tag: input.tagName, contenteditable: input.isContentEditable };
@@ -1275,7 +1205,7 @@ async function askChatGPT(args = {}) {
 const TOOLS = [
   {
     name: "bridge_route_create",
-    description: "Create a lightweight Control Plane route that maps one Codex executor thread to one ChatGPT Web session/tab. This does not drive Codex threads automatically.",
+    description: "Create a lightweight Control Plane route that maps one executor thread to one ChatGPT Web session/tab. The Codex Adapter can drive the bound thread through App Server.",
     inputSchema: { type: "object", properties: {
       route_id: { type: "string", description: "Stable route key, for example pokemon-rl." },
       name: { type: "string" },
@@ -1328,6 +1258,44 @@ const TOOLS = [
     }, required: ["route_id"] },
   },
   {
+    name: "codex_adapter_status",
+    description: "Inspect the Codex Adapter and route worker state without starting a Codex process.",
+    inputSchema: { type: "object", properties: { route_id: { type: "string" } } },
+  },
+  {
+    name: "codex_thread_start",
+    description: "Start or resume the Codex App Server worker for a route and bind its real thread id to the Control Plane.",
+    inputSchema: { type: "object", properties: {
+      route_id: { type: "string" },
+      codex_thread_id: { type: "string" },
+      cwd: { type: "string" },
+      model: { type: "string" },
+      base_instructions: { type: "string" },
+      approval_policy: { type: "string" },
+    }, required: ["route_id"] },
+  },
+  {
+    name: "codex_thread_turn",
+    description: "Send an explicit task to the Codex worker bound to a route and return its completed turn when available.",
+    inputSchema: { type: "object", properties: {
+      route_id: { type: "string" },
+      codex_thread_id: { type: "string" },
+      text: { type: "string" },
+      task: { type: "string" },
+      prompt: { type: "string" },
+      input: { type: "array" },
+      cwd: { type: "string" },
+      model: { type: "string" },
+      effort: { type: "string" },
+      timeout_ms: { type: "integer", default: 120000 },
+    }, required: ["route_id"] },
+  },
+  {
+    name: "codex_thread_read",
+    description: "Read the metadata for the Codex thread bound to a route through the App Server protocol.",
+    inputSchema: { type: "object", properties: { route_id: { type: "string" }, codex_thread_id: { type: "string" } }, required: ["route_id"] },
+  },
+  {
     name: "chatgpt_browser_session_create",
     description: "Create a persistent bridge session that owns one ChatGPT browser tab. Use a different session_id for each independent task; do not delete sessions through the bridge.",
     inputSchema: { type: "object", properties: {
@@ -1348,6 +1316,11 @@ const TOOLS = [
   {
     name: "chatgpt_browser_status",
     description: "Read-only check of the remote-debug browser and visible tabs.",
+    inputSchema: { type: "object", properties: { port: { type: "integer", default: DEFAULT_PORT } } },
+  },
+  {
+    name: "chatgpt_browser_health",
+    description: "Check the active ChatGPT Web adapter's selector strategies and report UI health without sending a prompt.",
     inputSchema: { type: "object", properties: { port: { type: "integer", default: DEFAULT_PORT } } },
   },
   {
@@ -1385,7 +1358,7 @@ const TOOLS = [
   },
   {
     name: "brain_plan",
-    description: "Start or reset the brain-hand mode. Ask ChatGPT Web to produce one concrete, verifiable next task for Codex Luna. The web model plans; Luna executes in the connected workspace.",
+    description: "Start or reset the brain-hand mode. Ask ChatGPT Web to produce one concrete, verifiable next task for the configured executor. The web model plans; the executor works in the connected workspace.",
     inputSchema: { type: "object", properties: {
       goal: { type: "string" },
       context: { type: "string" },
@@ -1397,7 +1370,7 @@ const TOOLS = [
   },
   {
     name: "executor_report",
-    description: "Send Codex Luna's execution result to the planning brain. Send concise final outcomes, changed files, tests, blockers, and evidence; never send hidden chain-of-thought, passwords, or tokens.",
+    description: "Send the executor's result to the planning brain. Send concise final outcomes, changed files, tests, blockers, and evidence; never send hidden chain-of-thought, passwords, or tokens.",
     inputSchema: { type: "object", properties: {
       report: { type: "string" },
       result: { type: "string" },
@@ -1468,6 +1441,7 @@ for (const tool of TOOLS) {
 
 const ROUTED_TOOLS = new Set([
   "chatgpt_browser_status",
+  "chatgpt_browser_health",
   "chatgpt_browser_open",
   "chatgpt_browser_list_conversations",
   "chatgpt_browser_select_conversation",
@@ -1479,6 +1453,9 @@ const ROUTED_TOOLS = new Set([
   "continue_task",
   "brain_status",
   "brain_reset",
+  "codex_thread_start",
+  "codex_thread_turn",
+  "codex_thread_read",
 ]);
 
 async function callToolDirect(name, args) {
@@ -1489,10 +1466,15 @@ async function callToolDirect(name, args) {
   if (name === "bridge_route_pause") return routePause(args);
   if (name === "bridge_route_resume") return routeResume(args);
   if (name === "bridge_route_event") return routeEvent(args);
+  if (name === "codex_adapter_status") return codexAdapterStatus(args);
+  if (name === "codex_thread_start") return codexThreadStart(args);
+  if (name === "codex_thread_turn") return codexThreadTurn(args);
+  if (name === "codex_thread_read") return codexThreadRead(args);
   if (name === "chatgpt_browser_session_create") return createSession(args);
   if (name === "chatgpt_browser_session_list") return listSessions();
   if (name === "chatgpt_browser_launch") return jsonResult("dedicated browser launched; sign in manually", launchBrowser(args));
   if (name === "chatgpt_browser_status") return browserStatus(args);
+  if (name === "chatgpt_browser_health") return browserHealth(args);
   if (name === "chatgpt_browser_open") return openChatGPT(args);
   if (name === "chatgpt_browser_list_conversations") return listConversations(args);
   if (name === "chatgpt_browser_select_conversation") return selectConversation(args);

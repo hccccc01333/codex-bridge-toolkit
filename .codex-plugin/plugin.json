@@ -1,7 +1,7 @@
 {
   "name": "chatgpt-web-bridge",
-  "version": "0.1.0+codex.20260819130814",
-  "description": "A local MCP bridge for visible ChatGPT Web communication and brain-hand orchestration, where ChatGPT Web plans and reviews while Codex Luna executes locally.",
+  "version": "0.1.0+codex.20260819135532",
+  "description": "A protocol-driven MCP bridge for visible ChatGPT Web planning, Codex App Server execution, and future brain/executor adapters.",
   "author": {
     "name": "Local developer"
   },
@@ -9,8 +9,8 @@
   "interface": {
     "displayName": "ChatGPT Web Bridge",
     "shortDescription": "Let ChatGPT Web plan while Luna executes.",
-    "longDescription": "ChatGPT Web Bridge launches or connects to a dedicated browser session, lets the user sign in manually, relays visible prompts and replies, and supports brain-hand planning, execution reports, review, and bounded multi-round continuation. It does not read passwords or call private web endpoints.",
-    "developerName": "Local developer",
+    "longDescription": "ChatGPT Web Bridge launches or connects to a dedicated browser session, lets the user sign in manually, relays visible prompts and replies, supports brain-hand planning and evidence-first review, and can bind Codex App Server worker threads to Control Plane routes. It does not read passwords or call private web endpoints.",
+    "developerName": "Codex Luna Bridge contributors",
     "category": "Productivity",
     "capabilities": [
       "Interactive",

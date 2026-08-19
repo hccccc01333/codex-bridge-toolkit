@@ -2,11 +2,95 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+let DatabaseSync = null;
+try {
+  ({ DatabaseSync } = await import("node:sqlite"));
+} catch {
+  // Older Node runtimes use the file-backed fallback below.
+}
+
 export const DEFAULT_ROUTE_ID = "default";
 const ROUTE_DIR = path.join(process.env.LOCALAPPDATA || os.homedir(), "CodexChatGPTBridge", "routes");
+const CONTROL_PLANE_DB_PATH = process.env.CODEX_BRIDGE_DB_PATH
+  || path.join(process.env.LOCALAPPDATA || os.homedir(), "CodexChatGPTBridge", "control-plane.sqlite");
 const MAX_EVENTS = 80;
 const MAX_PENDING_EVENTS = 40;
+const ROUTE_LOCK_LEASE_MS = 120000;
+const ROUTE_LOCK_POLL_MS = 50;
 const routeQueues = new Map();
+let controlDb = null;
+
+function getControlDb() {
+  if (!DatabaseSync) return null;
+  if (controlDb) return controlDb;
+  fs.mkdirSync(path.dirname(CONTROL_PLANE_DB_PATH), { recursive: true });
+  controlDb = new DatabaseSync(CONTROL_PLANE_DB_PATH);
+  controlDb.exec(`
+    CREATE TABLE IF NOT EXISTS route_locks (
+      route_id TEXT PRIMARY KEY,
+      owner TEXT NOT NULL,
+      lease_until INTEGER NOT NULL
+    );
+  `);
+  return controlDb;
+}
+
+function lockOwner(routeId) {
+  return `${process.pid}:${routeId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function tryAcquireDistributedLock(routeId, owner) {
+  const db = getControlDb();
+  if (!db) return true;
+  const nowMs = Date.now();
+  const leaseUntil = nowMs + ROUTE_LOCK_LEASE_MS;
+  db.prepare(`
+    INSERT INTO route_locks (route_id, owner, lease_until)
+    VALUES (?, ?, ?)
+    ON CONFLICT(route_id) DO UPDATE SET
+      owner = excluded.owner,
+      lease_until = excluded.lease_until
+    WHERE route_locks.lease_until <= ? OR route_locks.owner = ?
+  `).run(routeId, owner, leaseUntil, nowMs, owner);
+  const row = db.prepare("SELECT owner FROM route_locks WHERE route_id = ?").get(routeId);
+  return row?.owner === owner;
+}
+
+function renewDistributedLock(routeId, owner) {
+  const db = getControlDb();
+  if (!db) return;
+  db.prepare("UPDATE route_locks SET lease_until = ? WHERE route_id = ? AND owner = ?")
+    .run(Date.now() + ROUTE_LOCK_LEASE_MS, routeId, owner);
+}
+
+function releaseDistributedLock(routeId, owner) {
+  const db = getControlDb();
+  if (!db) return;
+  db.prepare("DELETE FROM route_locks WHERE route_id = ? AND owner = ?").run(routeId, owner);
+}
+
+async function withDistributedRouteLock(routeId, handler, { timeoutMs = 300000 } = {}) {
+  const db = getControlDb();
+  if (!db) return handler();
+  const owner = lockOwner(routeId);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (tryAcquireDistributedLock(routeId, owner)) {
+      const heartbeat = setInterval(() => renewDistributedLock(routeId, owner), ROUTE_LOCK_LEASE_MS / 3);
+      heartbeat.unref?.();
+      try {
+        return await handler();
+      } finally {
+        clearInterval(heartbeat);
+        releaseDistributedLock(routeId, owner);
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, ROUTE_LOCK_POLL_MS));
+  }
+  const error = new Error(`timed out waiting for route lock: ${routeId}`);
+  error.code = "ROUTE_LOCK_TIMEOUT";
+  throw error;
+}
 
 function now() {
   return new Date().toISOString();
@@ -182,8 +266,16 @@ export function enqueueRouteEvent(routeId, event = {}) {
 }
 
 export function routeQueueState(routeId) {
-  const runtime = routeQueues.get(normalizeRouteId(routeId));
-  return runtime ? { queued: true } : { queued: false };
+  const id = normalizeRouteId(routeId);
+  const runtime = routeQueues.get(id);
+  const db = getControlDb();
+  const lock = db?.prepare("SELECT owner, lease_until FROM route_locks WHERE route_id = ?").get(id) || null;
+  return {
+    queued: Boolean(runtime || lock),
+    in_process: Boolean(runtime),
+    distributed_lock: Boolean(lock),
+    lock_until: lock?.lease_until || null,
+  };
 }
 
 function removeQueuedAction(pending, action) {
@@ -195,7 +287,7 @@ function removeQueuedAction(pending, action) {
 export function enqueueRouteAction(routeId, action, handler, { allowPaused = false } = {}) {
   const id = normalizeRouteId(routeId);
   const previous = routeQueues.get(id) || Promise.resolve();
-  const next = previous.catch(() => undefined).then(async () => {
+  const next = previous.catch(() => undefined).then(() => withDistributedRouteLock(id, async () => {
     let route = readRoute(id);
     if (route.status === "paused" && !allowPaused) {
       const pending = removeQueuedAction(Array.isArray(route.queue?.pending) ? route.queue.pending : [], action);
@@ -250,7 +342,7 @@ export function enqueueRouteAction(routeId, action, handler, { allowPaused = fal
       });
       throw error;
     }
-  });
+  }));
   routeQueues.set(id, next);
   next.finally(() => {
     if (routeQueues.get(id) === next) routeQueues.delete(id);

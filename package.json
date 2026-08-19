@@ -1,0 +1,9 @@
+{
+  "name": "chatgpt-web-bridge",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "check": "node --check scripts/mcp_server.mjs && node --check scripts/control_plane.mjs && node --check scripts/protocol.mjs"
+  }
+}
