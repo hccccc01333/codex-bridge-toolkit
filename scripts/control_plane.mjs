@@ -20,6 +20,16 @@ const ROUTE_LOCK_POLL_MS = 50;
 const routeQueues = new Map();
 let controlDb = null;
 
+export function controlPlaneCapabilities() {
+  return {
+    distributed_lock: Boolean(DatabaseSync),
+    serialization_scope: DatabaseSync ? "process-and-cross-process" : "process-only",
+    note: DatabaseSync
+      ? "SQLite route leases are active."
+      : "node:sqlite is unavailable; route snapshots work but cross-process serialization is not guaranteed.",
+  };
+}
+
 function getControlDb() {
   if (!DatabaseSync) return null;
   if (controlDb) return controlDb;
@@ -123,6 +133,10 @@ export function newRouteRecord(routeId, fields = {}) {
   return {
     route_id: id,
     name: String(fields.name || id),
+    brain_provider: String(fields.brain_provider || fields.brainProvider || "chatgpt").trim().toLowerCase() || "chatgpt",
+    executor_provider: String(fields.executor_provider || fields.executorProvider || "chatgpt_luna").trim().toLowerCase() || "chatgpt_luna",
+    executor_model: fields.executor_model || fields.executorModel || null,
+    executor_profile: fields.executor_profile || fields.executorProfile || null,
     codex_thread_id: fields.codex_thread_id || fields.codexThreadId || null,
     session_id: fields.session_id || fields.sessionId || id,
     target_id: fields.target_id || fields.targetId || null,
@@ -201,6 +215,10 @@ export function routeSummary(route) {
   return {
     route_id: route.route_id,
     name: route.name,
+    brain_provider: route.brain_provider || "chatgpt",
+    executor_provider: route.executor_provider || "chatgpt_luna",
+    executor_model: route.executor_model || null,
+    executor_profile: route.executor_profile || null,
     codex_thread_id: route.codex_thread_id || null,
     session_id: route.session_id || null,
     target_id: route.target_id || null,
@@ -274,6 +292,8 @@ export function routeQueueState(routeId) {
     queued: Boolean(runtime || lock),
     in_process: Boolean(runtime),
     distributed_lock: Boolean(lock),
+    distributed_lock_available: Boolean(DatabaseSync),
+    serialization_scope: DatabaseSync ? "process-and-cross-process" : "process-only",
     lock_until: lock?.lease_until || null,
   };
 }

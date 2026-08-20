@@ -1,29 +1,37 @@
-const CHATGPT_HOSTS = new Set(["chatgpt.com", "www.chatgpt.com"]);
+import { getBrainProvider } from "../adapters/web_brain.mjs";
 
-export function conversationIdFromUrl(rawUrl) {
+export function conversationIdFromUrl(rawUrl, provider = "chatgpt") {
   try {
+    const profile = getBrainProvider(provider);
     const url = new URL(rawUrl);
-    const match = url.pathname.match(/^\/c\/([^/]+)/i);
-    return match?.[1] || null;
+    for (const prefix of profile.conversation_prefixes) {
+      if (url.pathname.toLowerCase().startsWith(prefix.toLowerCase())) {
+        const remainder = url.pathname.slice(prefix.length).split("/")[0];
+        if (/^[A-Za-z0-9_-]+$/.test(remainder)) return remainder;
+      }
+    }
+    return null;
   } catch {
     return null;
   }
 }
 
-export function safeConversationUrl(rawUrlOrId) {
+export function safeConversationUrl(rawUrlOrId, provider = "chatgpt") {
+  const profile = getBrainProvider(provider);
   const value = String(rawUrlOrId || "").trim();
   if (!value) return null;
-  if (/^[A-Za-z0-9_-]{8,}$/.test(value)) return `https://chatgpt.com/c/${value}`;
+  if (/^[A-Za-z0-9_-]{8,}$/.test(value)) return `${profile.start_url.replace(/\/$/, "")}${profile.default_conversation_prefix}${value}`;
   let url;
   try { url = new URL(value); } catch { return null; }
-  if (!CHATGPT_HOSTS.has(url.hostname.toLowerCase())) return null;
-  if (!/^\/c\/[A-Za-z0-9_-]+$/i.test(url.pathname)) return null;
-  return `https://chatgpt.com${url.pathname}`;
+  if (!profile.hosts.includes(url.hostname.toLowerCase())) return null;
+  if (!profile.conversation_prefixes.some(prefix => url.pathname.toLowerCase().startsWith(prefix.toLowerCase()))) return null;
+  if (!conversationIdFromUrl(url.href, profile.id)) return null;
+  return `${url.origin}${url.pathname}`;
 }
 
-export function conversationMatches({ expectedId, actualId, actualUrl } = {}) {
+export function conversationMatches({ expectedId, actualId, actualUrl, provider = "chatgpt" } = {}) {
   const expected = String(expectedId || "").trim();
   if (!expected) return true;
-  const actual = String(actualId || conversationIdFromUrl(actualUrl) || "").trim();
+  const actual = String(actualId || conversationIdFromUrl(actualUrl, provider) || "").trim();
   return Boolean(actual) && actual === expected;
 }

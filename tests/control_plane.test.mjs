@@ -11,8 +11,10 @@ process.env.CODEX_BRIDGE_DB_PATH = path.join(testRoot, "control-plane.sqlite");
 const controlPlane = await import(`../scripts/control_plane.mjs?test=${Date.now()}`);
 const {
   enqueueRouteAction,
+  controlPlaneCapabilities,
   newRouteRecord,
   readRoute,
+  routeQueueState,
   updateRoute,
   writeRoute,
 } = controlPlane;
@@ -32,6 +34,29 @@ test("T7 route state remains isolated between sessions", () => {
   assert.equal(readRoute("test-alpha").latest_task, "alpha-only");
   assert.equal(readRoute("test-beta").latest_task, null);
   assert.equal(readRoute("test-beta").session_id, "session-beta");
+});
+
+test("route metadata preserves the selected brain and executor providers", () => {
+  resetRoute("deepseek-route", {
+    session_id: "deepseek-session",
+    brain_provider: "deepseek",
+    executor_provider: "deepseek_api",
+    executor_model: "deepseek-v4-flash",
+    executor_profile: "my-deepseek",
+  });
+  assert.equal(readRoute("deepseek-route").brain_provider, "deepseek");
+  const summary = controlPlane.routeSummary(readRoute("deepseek-route"));
+  assert.equal(summary.brain_provider, "deepseek");
+  assert.equal(summary.executor_provider, "deepseek_api");
+  assert.equal(summary.executor_model, "deepseek-v4-flash");
+  assert.equal(summary.executor_profile, "my-deepseek");
+});
+
+test("route status reports whether serialization is cross-process", () => {
+  const capabilities = controlPlaneCapabilities();
+  const queue = routeQueueState("test-alpha");
+  assert.equal(queue.distributed_lock_available, capabilities.distributed_lock);
+  assert.equal(queue.serialization_scope, capabilities.serialization_scope);
 });
 
 test("T8 actions for one route are serialized", async () => {

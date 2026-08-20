@@ -1,30 +1,13 @@
-export const SELECTOR_STRATEGIES = Object.freeze([
-  Object.freeze({
-    name: "contenteditable-role",
-    input: '[contenteditable="true"][role="textbox"]',
-    send: 'button[data-testid="send-button"]',
-  }),
-  Object.freeze({
-    name: "enabled-textarea",
-    input: 'textarea:not([disabled])',
-    send: 'button[data-testid="send-button"]',
-  }),
-  Object.freeze({
-    name: "contenteditable-fallback",
-    input: '[contenteditable="true"]',
-    send: 'button[data-testid="send-button"]',
-  }),
-]);
+import { getBrainProvider, selectorHealthScript as providerSelectorHealthScript } from "../adapters/web_brain.mjs";
 
-export function selectorHealthScript() {
-  const strategies = JSON.stringify(SELECTOR_STRATEGIES);
-  return `(() => {
-    const strategies = ${strategies};
-    const result = strategies.map(strategy => ({
-      name: strategy.name,
-      input: Boolean(document.querySelector(strategy.input)),
-      send: Boolean(document.querySelector(strategy.send)),
-    }));
-    return { ok: result.some(item => item.input && item.send), strategies: result };
-  })()`;
+export const SELECTOR_STRATEGIES = Object.freeze(
+  getBrainProvider("chatgpt").input_selectors.map((input, index) => Object.freeze({
+    name: index === 0 ? "contenteditable-role" : index === 1 ? "enabled-textarea" : "contenteditable-fallback",
+    input,
+    send: getBrainProvider("chatgpt").send_selectors[0],
+  })),
+);
+
+export function selectorHealthScript(provider = "chatgpt") {
+  return providerSelectorHealthScript(provider);
 }
