@@ -5,7 +5,8 @@ import {
   roundLimitReached as defaultRoundLimitReached,
 } from "../orchestration/stop_policy.mjs";
 
-export const TERMINAL_STATUSES = new Set(["completed", "blocked", "repeated", "max_rounds"]);
+export const TERMINAL_STATUSES = new Set(["completed", "blocked", "repeated", "max_rounds", "continuous_safety_limit"]);
+export const DEFAULT_CONTINUOUS_SAFETY_LIMIT = 1000;
 
 function list(value) {
   if (value === undefined || value === null || value === "") return [];
@@ -49,7 +50,12 @@ function statusOf(data, fallback = "continue") {
   if (["blocked", "blocker"].includes(value)) return "blocked";
   if (["repeated", "repeat", "loop"].includes(value)) return "repeated";
   if (["max_rounds", "max-rounds"].includes(value)) return "max_rounds";
+  if (["continuous_safety_limit", "continuous-safety-limit"].includes(value)) return "continuous_safety_limit";
   return "continue";
+}
+
+function continuousOf(args = {}, state = {}) {
+  return args.continuous === true || args.mode === "continuous" || state.continuous === true;
 }
 
 export function normalizeRuntimePlan(result, fallback = {}) {
@@ -179,7 +185,9 @@ export function createRuntimeRunner({
 
   async function runRound(args = {}) {
     let state = getState();
-    let maxRounds = maxRoundsOf(args.max_rounds ?? state.maxRounds ?? DEFAULT_MAX_ROUNDS, DEFAULT_MAX_ROUNDS);
+    const continuous = continuousOf(args, state);
+    let maxRounds = continuous ? null : maxRoundsOf(args.max_rounds ?? state.maxRounds ?? DEFAULT_MAX_ROUNDS, DEFAULT_MAX_ROUNDS);
+    state.continuous = continuous;
     state.maxRounds = maxRounds;
     const round = Number.isInteger(Number(state.round)) ? Number(state.round) : 0;
     const existingTerminal = state.latestReview?.status || state.latestPlan?.status;
@@ -203,7 +211,7 @@ export function createRuntimeRunner({
         return stop(state, { status: "blocked", round, max_rounds: maxRounds, stage: "plan", reason: planError.message, code: planError.code });
       }
       state = getState();
-      maxRounds = maxRoundsOf(args.max_rounds ?? state.maxRounds ?? DEFAULT_MAX_ROUNDS, DEFAULT_MAX_ROUNDS);
+      maxRounds = continuous ? null : maxRoundsOf(args.max_rounds ?? state.maxRounds ?? DEFAULT_MAX_ROUNDS, DEFAULT_MAX_ROUNDS);
       plan = normalizeRuntimePlan(planResult, { round });
       state.latestPlan = plan;
     }
@@ -245,7 +253,7 @@ export function createRuntimeRunner({
       await persist({ state, decision: review });
       return { continued: false, stopped: true, status: review.status, round, max_rounds: maxRounds, review, report };
     }
-    if (roundLimitReached(round, maxRounds)) {
+    if (!continuous && roundLimitReached(round, maxRounds)) {
       state.latestReview = { ...review, status: "max_rounds", reason: `maximum rounds reached: ${maxRounds}` };
       return stop(state, { status: "max_rounds", round, max_rounds: maxRounds, stage: "stop_policy", reason: state.latestReview.reason, review, report });
     }
@@ -268,23 +276,29 @@ export function createRuntimeRunner({
 
   async function runUntilStop(args = {}) {
     const state = getState();
-    const maxRounds = maxRoundsOf(args.max_rounds ?? state.maxRounds ?? DEFAULT_MAX_ROUNDS, DEFAULT_MAX_ROUNDS);
+    const continuous = continuousOf(args, state);
+    const maxRounds = continuous ? null : maxRoundsOf(args.max_rounds ?? state.maxRounds ?? DEFAULT_MAX_ROUNDS, DEFAULT_MAX_ROUNDS);
     const rounds = [];
-    const hardLimit = maxRounds + 1;
+    const safetyLimit = Math.max(1, Number(args.safety_limit ?? DEFAULT_CONTINUOUS_SAFETY_LIMIT));
+    const hardLimit = continuous ? safetyLimit : maxRounds + 1;
     for (let index = 0; index < hardLimit; index += 1) {
-      const result = await runRound({ ...args, max_rounds: maxRounds });
+      const result = await runRound({ ...args, continuous, max_rounds: continuous ? undefined : maxRounds });
       rounds.push(result);
       if (result.stopped || !result.continued) {
         return { ...result, rounds: rounds.map(roundSummary), rounds_run: rounds.length };
       }
     }
     return stop(getState(), {
-      status: "max_rounds",
+      status: continuous ? "continuous_safety_limit" : "max_rounds",
       round: Number(state.round || 0),
       max_rounds: maxRounds,
+      safety_limit: continuous ? safetyLimit : undefined,
       stage: "stop_policy",
-      reason: `runtime safety limit reached: ${maxRounds}`,
+      reason: continuous
+        ? `continuous safety limit reached: ${safetyLimit}`
+        : `runtime safety limit reached: ${maxRounds}`,
       rounds: rounds.map(roundSummary),
+      rounds_run: rounds.length,
     });
   }
 

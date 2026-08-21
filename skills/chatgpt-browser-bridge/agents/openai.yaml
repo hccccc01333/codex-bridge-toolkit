@@ -1,4 +1,4 @@
 interface:
-  display_name: "ChatGPT Brain-Hand Bridge"
-  short_description: "Let ChatGPT Web plan and Luna execute"
-  default_prompt: "Use $chatgpt-browser-bridge in brain-hand mode to plan, execute, report, review, and continue the task."
+  display_name: "Codex ↔ Web LLM Bridge"
+  short_description: "Connect Codex to a visible web AI"
+  default_prompt: "Use $chatgpt-browser-bridge to discover a visible web AI, connect the selected conversation, ask the user what they want to accomplish, compile the answer with bridge_goal_create, and then relay the attached bridge goal in one-shot, bounded, or continuous mode without exposing internal routing IDs or putting controls or messages in the status panel."

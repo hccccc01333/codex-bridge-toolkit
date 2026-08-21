@@ -6,6 +6,7 @@ const MAX_CONTEXT_CHARS = 24000;
 export function newBrainState(defaultMaxRounds = 20) {
   return {
     mode: "brain-hand",
+    continuous: false,
     goal: "",
     taskIR: null,
     constraints: [],

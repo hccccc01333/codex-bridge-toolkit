@@ -219,6 +219,35 @@ export class CodexAdapter {
     return this.request("thread/read", { threadId: thread_id });
   }
 
+  async setThreadGoal({ thread_id, objective, status = "active", tokenBudget = null } = {}) {
+    if (!thread_id) throw new Error("codex_thread_id is required");
+    const goal = String(objective || "").trim();
+    if (!goal) throw new Error("goal objective is required");
+    if (goal.length > 4000) throw new Error("goal objective must be at most 4000 characters");
+    await this.connect();
+    const params = {
+      threadId: thread_id,
+      objective: goal,
+      status: String(status || "active"),
+    };
+    if (tokenBudget !== null && tokenBudget !== undefined) {
+      params.tokenBudget = tokenBudget;
+    }
+    return this.request("thread/goal/set", params);
+  }
+
+  async getThreadGoal(thread_id) {
+    if (!thread_id) throw new Error("codex_thread_id is required");
+    await this.connect();
+    return this.request("thread/goal/get", { threadId: thread_id });
+  }
+
+  async clearThreadGoal(thread_id) {
+    if (!thread_id) throw new Error("codex_thread_id is required");
+    await this.connect();
+    return this.request("thread/goal/clear", { threadId: thread_id });
+  }
+
   status() {
     return {
       state: this.state,

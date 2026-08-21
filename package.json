@@ -4,6 +4,6 @@
   "type": "module",
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "check": "node --check scripts/mcp_server.mjs && node --check scripts/control_plane.mjs && node --check scripts/protocol.mjs && node --check src/runtime/runner.mjs"
+    "check": "node --check scripts/mcp_server.mjs && node --check scripts/panel_server.mjs && node --check scripts/control_plane.mjs && node --check scripts/protocol.mjs && node --check src/runtime/runner.mjs && node --check src/bridge/goal_compiler.mjs && node --check src/bridge/relay_contract.mjs && node --check src/bridge/relay_engine.mjs && node --check src/browser/discovery.mjs && node --check src/adapters/codex.mjs && node --check src/adapters/web_llm_adapter.mjs && node --check src/adapters/provider_registry.mjs && node --check src/panel/mcp_client.mjs"
   }
 }

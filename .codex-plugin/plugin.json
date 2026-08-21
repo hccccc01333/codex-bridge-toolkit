@@ -1,15 +1,15 @@
 {
   "name": "chatgpt-web-bridge",
-  "version": "0.1.0+codex.20260820103606",
-  "description": "A protocol-driven local agent orchestration runtime for visible web AI planning, Codex App Server execution, and extensible brain/executor adapters.",
+  "version": "0.2.0+codex.20260821051423",
+  "description": "A user-facing Codex to Web LLM conversation bridge with visible browser discovery, ChatGPT/DeepSeek adapters, safe relay modes, and local Codex execution.",
   "author": {
     "name": "Local developer"
   },
   "skills": "./skills/",
   "interface": {
-    "displayName": "ChatGPT Web Bridge",
-    "shortDescription": "Let a selected web brain plan while Codex executes.",
-    "longDescription": "ChatGPT Web Bridge uses ChatGPT Web by default and lets the user choose DeepSeek Web as an alternative visible planning brain. The Codex executor defaults to ChatGPT Luna, can use DeepSeek API Pro or Flash profiles, and can inherit the user's current local Codex configuration when that configuration already uses DeepSeek. It launches or connects to a dedicated browser session, relays rendered prompts and replies, supports brain-hand planning and evidence-first review, and binds Codex App Server worker threads to Control Plane routes. It does not read passwords, API keys, or call private web endpoints.",
+    "displayName": "Codex \u2194 Web LLM Bridge",
+    "shortDescription": "Connect the current Codex task to a visible web AI.",
+    "longDescription": "Codex \u2194 Web LLM Conversation Bridge connects the current Codex task to ChatGPT Web, DeepSeek Web, and future web-LLM adapters without exposing browser ports or routing IDs. It discovers visible browser instances, presents windows/tabs/conversations by human-readable names, supports one-shot, manual link, bounded relay, and continuous goal modes, verifies the destination before every send, and provides a two-column conversation UI in hosts that support UI resources. It never reads passwords, cookies, API keys, private endpoints, or hidden chain-of-thought.",
     "developerName": "Codex Luna Bridge contributors",
     "category": "Productivity",
     "capabilities": [
@@ -19,9 +19,10 @@
     ],
     "brandColor": "#10A37F",
     "defaultPrompt": [
-      "Run one bounded brain-to-Codex round for this task.",
-      "Send the executor's report to the selected web planning brain.",
-      "Use ChatGPT Web by default, or choose DeepSeek Web with brain_provider: deepseek; choose executor_provider: deepseek_api for a named DeepSeek profile, or codex_current to inherit a user's existing Codex/DeepSeek configuration."
+      "Open the two-column web bridge panel inside this Codex conversation.",
+      "Connect this Codex conversation to a visible web AI.",
+      "Ask the connected web model one question or relay the current Codex task.",
+      "Use Brain-Hand mode when the web model should plan/review and Codex should execute the current conversation goal locally."
     ]
   },
   "mcpServers": "./.mcp.json"

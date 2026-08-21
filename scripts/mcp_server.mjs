@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import readline from "node:readline";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import {
   DEFAULT_ROUTE_ID,
   appendRouteEvent,
@@ -38,7 +41,6 @@ import {
   conversationIdFromUrl,
   safeConversationUrl,
 } from "../src/browser/conversation_router.mjs";
-import { selectorHealthScript } from "../src/browser/selectors.mjs";
 import {
   DEFAULT_BRAIN_PROVIDER,
   getBrainProvider,
@@ -57,7 +59,25 @@ import {
   normalizeExecutorProvider,
 } from "../src/adapters/executor.mjs";
 import { createCodexAdapter } from "../src/adapters/codex.mjs";
+import { getWebLLMAdapter } from "../src/adapters/provider_registry.mjs";
 import { createRuntimeRunner } from "../src/runtime/runner.mjs";
+import {
+  createMessageEnvelope,
+  normalizeRelayConfig,
+  userFacingRelayMode,
+} from "../src/bridge/relay_contract.mjs";
+import { compileUserGoal } from "../src/bridge/goal_compiler.mjs";
+import { createRelayEngine } from "../src/bridge/relay_engine.mjs";
+import { createPanelServer } from "./panel_server.mjs";
+import {
+  browserInstanceFromEndpoint,
+  discoveryText,
+  publicBrowserChoices,
+  selectTab,
+  selectTabInWindow,
+  selectWindow,
+  undebuggableBrowserInstance,
+} from "../src/browser/discovery.mjs";
 import {
   clip as brainClip,
   decisionFromReply,
@@ -75,6 +95,10 @@ import {
 const DEFAULT_PORT = 9222;
 const SERVER_NAME = "chatgpt-web-bridge";
 const SERVER_VERSION = "0.1.0";
+const MCP_UI_RESOURCE_URI = "ui://codex-web-bridge/control-panel-v1.html";
+const MCP_UI_RESOURCE_MIME = "text/html;profile=mcp-app";
+const SERVER_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const MCP_UI_RESOURCE_PATH = path.join(SERVER_ROOT, "ui", "mcp_control_panel.html");
 const DEFAULT_MAX_ROUNDS = STOP_DEFAULT_MAX_ROUNDS;
 const HARD_MAX_ROUNDS = STOP_HARD_MAX_ROUNDS;
 const DEFAULT_SESSION_ID = "default";
@@ -126,6 +150,12 @@ let activeSession = null;
 let activeRouteId = DEFAULT_ROUTE_ID;
 let activeRoute = null;
 const codexAdapters = new Map();
+let activeBridgeLink = null;
+let activeRelayEngine = null;
+let activePanel = null;
+let pendingDedicatedLaunch = null;
+const pendingBrainTargetCreation = new Map();
+const execFileAsync = promisify(execFile);
 
 let brainState = createBrainState(DEFAULT_MAX_ROUNDS);
 
@@ -707,6 +737,74 @@ async function codexThreadStart(args = {}) {
   }
 }
 
+async function syncCodexNativeGoal({ routeId = activeRouteId, objective, status = "active", tokenBudget = null } = {}) {
+  const id = normalizeRouteId(routeId);
+  const route = readRoute(id);
+  const goal = String(objective || "").trim();
+  if (!goal) {
+    return { synced: false, state: "pending", code: "CODEX_GOAL_EMPTY", reason: "native Codex Goal objective is empty" };
+  }
+  if (!route.codex_thread_id) {
+    const pending = {
+      synced: false,
+      state: "pending",
+      code: "CODEX_WORKER_NOT_STARTED",
+      reason: "Codex worker has not started; native Goal will be retried when the worker starts",
+    };
+    const updated = updateRoute(id, { native_goal: pending });
+    if (activeRouteId === id) activeRoute = updated;
+    return pending;
+  }
+  try {
+    const provider = getExecutorProvider(route.executor_provider || DEFAULT_EXECUTOR_PROVIDER);
+    const model = executorModelOf(provider, route.executor_model || "");
+    const profile = codexProfileOf(provider, route.executor_profile || "", model);
+    const adapter = codexAdapterForRoute(id, provider.id, model, profile);
+    const result = await adapter.setThreadGoal({
+      thread_id: route.codex_thread_id,
+      objective: goal,
+      status,
+      tokenBudget,
+    });
+    const native = result?.goal || {};
+    const synced = {
+      synced: true,
+      state: "synced",
+      method: "thread/goal/set",
+      thread_id: route.codex_thread_id,
+      objective: native.objective || goal,
+      status: native.status || status,
+      token_budget: native.tokenBudget ?? tokenBudget ?? null,
+      synced_at: new Date().toISOString(),
+    };
+    const updated = updateRoute(id, { native_goal: synced, last_action: "codex_thread_goal_set" });
+    appendRouteEvent(id, {
+      type: "CODEX_GOAL_SYNCED",
+      summary: `Codex native Goal synced: ${route.codex_thread_id}`,
+      data: { method: synced.method, status: synced.status },
+    });
+    if (activeRouteId === id) activeRoute = readRoute(id);
+    return { ...synced, route: routeSummary(updated) };
+  } catch (error) {
+    const failed = {
+      synced: false,
+      state: "pending",
+      code: error.code || "CODEX_GOAL_SYNC_FAILED",
+      reason: String(error),
+      thread_id: route.codex_thread_id,
+      method: "thread/goal/set",
+    };
+    const updated = updateRoute(id, { native_goal: failed, last_action: "codex_thread_goal_sync_failed" });
+    appendRouteEvent(id, {
+      type: "CODEX_GOAL_SYNC_FAILED",
+      summary: `Codex native Goal sync failed: ${route.codex_thread_id}`,
+      data: { code: failed.code, reason: failed.reason },
+    });
+    if (activeRouteId === id) activeRoute = readRoute(id);
+    return { ...failed, route: routeSummary(updated) };
+  }
+}
+
 async function codexThreadTurn(args = {}) {
   let route = activateRoute(args);
   const threadId = args.codex_thread_id || route.codex_thread_id;
@@ -780,6 +878,26 @@ function jsonResult(text, structuredContent = undefined, isError = false) {
   return result;
 }
 
+function nativeUiResult(text, structuredContent = undefined, isError = false) {
+  const result = jsonResult(text, structuredContent, isError);
+  result._meta = { ui: { resourceUri: MCP_UI_RESOURCE_URI } };
+  return result;
+}
+
+function nativeUiResource() {
+  return {
+    uri: MCP_UI_RESOURCE_URI,
+    name: "Codex Web LLM Bridge control panel",
+    title: "Codex ↔ Web LLM Bridge",
+    description: "Native in-conversation status display for a visible ChatGPT Web or DeepSeek Web connection.",
+    mimeType: MCP_UI_RESOURCE_MIME,
+  };
+}
+
+function readNativeUiHtml() {
+  return fs.readFileSync(MCP_UI_RESOURCE_PATH, "utf8");
+}
+
 const clip = brainClip;
 const stringList = brainStringList;
 const maxRoundsOf = value => stopMaxRoundsOf(value, DEFAULT_MAX_ROUNDS);
@@ -826,7 +944,8 @@ async function brainPlan(args = {}) {
   brainState = newBrainState();
   brainState.goal = goal;
   brainState.constraints = stringList(args.constraints);
-  brainState.maxRounds = maxRoundsOf(args.max_rounds);
+  brainState.continuous = args.continuous === true || args.mode === "continuous";
+  brainState.maxRounds = brainState.continuous ? null : maxRoundsOf(args.max_rounds);
   brainState.startedAt = new Date().toISOString();
   brainState.taskIR = taskIRFromArgs({ ...args, goal, constraints: brainState.constraints });
   const prompt = planPrompt(goal, brainState.constraints, JSON.stringify(brainState.taskIR, null, 2));
@@ -1116,28 +1235,76 @@ async function evaluate(expression) {
   return result?.result?.value;
 }
 
-async function createBrainTarget(port, provider = brainProviderOf()) {
-  const response = await fetch(`http://127.0.0.1:${port}/json/new?${provider.start_url}`, { method: "PUT" });
-  if (!response.ok) throw new Error(`could not create a browser tab: ${response.status} ${response.statusText}`);
-  const created = await response.json();
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    try {
-      const targets = await listTargets(port);
-      const ready = created?.id ? targets.find(item => item.id === created.id) : null;
-      if (ready?.webSocketDebuggerUrl) return ready;
-      if (created?.webSocketDebuggerUrl && attempt >= 2) return created;
-    } catch {}
-    await new Promise(resolve => setTimeout(resolve, 250));
-  }
-  return created;
+async function createBrainTarget(port, provider = brainProviderOf(), session = activeSession) {
+  const key = `${port}:${provider.id}:${session?.session_id || activeSessionId}`;
+  const pending = pendingBrainTargetCreation.get(key);
+  if (pending) return pending;
+  const operation = (async () => {
+    const response = await fetch(`http://127.0.0.1:${port}/json/new?${provider.start_url}`, { method: "PUT" });
+    if (!response.ok) throw new Error(`could not create a browser tab: ${response.status} ${response.statusText}`);
+    const created = await response.json();
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      try {
+        const targets = await listTargets(port);
+        const ready = created?.id ? targets.find(item => item.id === created.id) : null;
+        if (ready?.webSocketDebuggerUrl) return ready;
+        if (created?.webSocketDebuggerUrl && attempt >= 2) return created;
+      } catch {}
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    return created;
+  })().finally(() => pendingBrainTargetCreation.delete(key));
+  pendingBrainTargetCreation.set(key, operation);
+  return operation;
 }
 
-async function findBrainTarget(port, session = activeSession, provider = brainProviderOf()) {
+async function findBrainTarget(port, session = activeSession, provider = brainProviderOf(), selection = {}) {
   const targets = await listTargets(port);
   const pages = targets.filter(item => item.type === "page");
+  const requestedTargetId = String(selection.target_id || selection.targetId || "").trim();
+  const requestedTargetTitle = String(selection.target_title || selection.targetTitle || "").trim();
+  const requestedTargetUrl = String(selection.target_url || selection.targetUrl || "").trim();
+  const selectorCount = [requestedTargetId, requestedTargetTitle, requestedTargetUrl].filter(Boolean).length;
+  if (selectorCount > 1) {
+    const error = new Error("provide only one of target_id, target_title, or target_url");
+    error.code = "BROWSER_TARGET_SELECTOR_CONFLICT";
+    throw error;
+  }
+  if (selectorCount) {
+    const matches = requestedTargetId
+      ? pages.filter(item => item.id === requestedTargetId)
+      : requestedTargetUrl
+        ? pages.filter(item => item.url === requestedTargetUrl)
+        : pages.filter(item => item.title === requestedTargetTitle);
+    if (matches.length > 1) {
+      const value = requestedTargetId || requestedTargetUrl || requestedTargetTitle;
+      const kind = requestedTargetId ? "id" : requestedTargetUrl ? "URL" : "title";
+      const error = new Error(`browser target ${kind} is ambiguous: ${value}`);
+      error.code = "BROWSER_TARGET_AMBIGUOUS";
+      throw error;
+    }
+    const selected = matches[0];
+    if (!selected) {
+      const value = requestedTargetId || requestedTargetUrl || requestedTargetTitle;
+      const kind = requestedTargetId ? "ID" : requestedTargetUrl ? "URL" : "title";
+      const error = new Error(`browser target ${kind} not found: ${value}`);
+      error.code = "BROWSER_TARGET_NOT_FOUND";
+      throw error;
+    }
+    if (!providerMatchesUrl(provider, selected.url)) {
+      const error = new Error(`browser target is not a ${provider.display_name} page: ${selected.url || selected.title || selected.id}`);
+      error.code = "BROWSER_TARGET_PROVIDER_MISMATCH";
+      throw error;
+    }
+    return selected;
+  }
   if (session?.target_id) {
     const stored = pages.find(item => item.id === session.target_id);
     if (stored && providerMatchesUrl(provider, stored.url)) return stored;
+    // A session that already owns a tab must never fall through to another
+    // page. The caller can explicitly recover the closed tab, but normal
+    // sends and health checks must fail closed instead of switching targets.
+    return null;
   }
   if (session?.conversation?.id) {
     const stored = pages.find(item => providerMatchesUrl(provider, item.url) && conversationIdFromUrl(item.url || "", provider.id) === session.conversation.id);
@@ -1147,11 +1314,14 @@ async function findBrainTarget(port, session = activeSession, provider = brainPr
   return pages.find(item => providerMatchesUrl(provider, item.url) && !claimed.has(item.id)) || null;
 }
 
-async function ensureConnected(port, session = activeSession, provider = brainProviderOf()) {
+async function ensureConnected(port, session = activeSession, provider = brainProviderOf(), { allowCreate = !session?.target_id } = {}) {
   if (socket && socket.readyState === WebSocket.OPEN && target && session?.target_id === target.id && providerMatchesUrl(provider, target.url)) return;
-  let page = await findBrainTarget(port, session, provider) || await createBrainTarget(port, provider);
+  let page = await findBrainTarget(port, session, provider);
+  if (!page && allowCreate) page = await createBrainTarget(port, provider, session);
   if (!page) {
-    throw new Error(`no browser page found. Launch a browser with remote debugging on port ${port}, then open ${provider.start_url}`);
+    throw new Error(session?.target_id
+      ? "the bound browser tab is unavailable; no new tab was opened automatically"
+      : `no browser page found. Launch a browser with remote debugging on port ${port}, then open ${provider.start_url}`);
   }
   let lastError;
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -1178,7 +1348,9 @@ async function ensureConnected(port, session = activeSession, provider = brainPr
 }
 
 async function currentConversationData(provider = brainProviderOf()) {
-  const linkSelectors = JSON.stringify(provider.conversation_link_selectors);
+  const adapter = getWebLLMAdapter(provider.id);
+  const profile = adapter.profile;
+  const linkSelectors = JSON.stringify(profile.conversation_link_selectors);
   const state = await evaluate(`(() => {
     const url = location.href;
     const selectors = ${linkSelectors};
@@ -1186,17 +1358,19 @@ async function currentConversationData(provider = brainProviderOf()) {
     const current = links.find(anchor => anchor.href.split('?')[0] === url.split('?')[0]);
     const rawTitle = (current?.getAttribute('aria-label') || current?.innerText || document.title || '').trim();
     const title = rawTitle.replace('，已置顶对话', '').replace('（未读）', '').trim();
-    return { title, url, is_conversation: Boolean(${JSON.stringify(provider.conversation_prefixes)}.some(prefix => location.pathname.toLowerCase().startsWith(prefix.toLowerCase()))) };
+    return { title, url, is_conversation: Boolean(${JSON.stringify(profile.conversation_prefixes)}.some(prefix => location.pathname.toLowerCase().startsWith(prefix.toLowerCase()))) };
   })()`);
   return { ...state, id: conversationIdFromUrl(state?.url || "", provider.id) };
 }
 
 async function visibleConversations(query = "", provider = brainProviderOf()) {
+  const adapter = getWebLLMAdapter(provider.id);
+  const profile = adapter.profile;
   const queryLiteral = JSON.stringify(String(query || "").trim().toLowerCase());
   const conversations = await evaluate(`(() => {
     const query = ${queryLiteral};
     const seen = new Set();
-    const selectors = ${JSON.stringify(provider.conversation_link_selectors)};
+    const selectors = ${JSON.stringify(profile.conversation_link_selectors)};
     return selectors.flatMap(selector => [...document.querySelectorAll(selector)]).map(anchor => {
       const url = anchor.href.split('?')[0];
       const rawTitle = (anchor.getAttribute('aria-label') || anchor.innerText || '').trim();
@@ -1317,17 +1491,22 @@ function browserCandidates() {
   const programFiles = process.env.ProgramFiles || "C:\\Program Files";
   const programFilesX86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
   return [
-    path.join(local, "Google", "Chrome", "Application", "chrome.exe"),
-    path.join(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
-    path.join(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
     path.join(local, "Microsoft", "Edge", "Application", "msedge.exe"),
     path.join(programFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
     path.join(programFilesX86, "Microsoft", "Edge", "Application", "msedge.exe"),
+    path.join(local, "Google", "Chrome", "Application", "chrome.exe"),
+    path.join(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
+    path.join(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
   ];
 }
 
 function defaultProfileDir() {
-  return path.join(process.env.LOCALAPPDATA || os.homedir(), "CodexChatGPTBridge", "profile");
+  const localAppData = process.env.LOCALAPPDATA || os.homedir();
+  const preferred = path.join(localAppData, "CodexBridgeEdge");
+  const legacy = path.join(localAppData, "CodexChatGPTBridge", "profile");
+  // Keep an existing profile so users who tried an earlier plugin build do not
+  // lose their saved web login when the automatic launcher changes its name.
+  return fs.existsSync(preferred) || !fs.existsSync(legacy) ? preferred : legacy;
 }
 
 function launchBrowser(args = {}) {
@@ -1350,8 +1529,74 @@ function launchBrowser(args = {}) {
     "--no-default-browser-check",
     provider.start_url,
   ], { detached: true, stdio: "ignore", windowsHide: false });
+  child.once("error", () => {});
   child.unref();
-  return { launched: true, executable, port, profile_dir: profileDir, url: provider.start_url, brain_provider: provider.id };
+  return {
+    launched: true,
+    automatic_profile: !args.profile_dir,
+    executable,
+    browser_name: /msedge(?:\.exe)?$/i.test(executable) ? "Edge" : "Chrome",
+    port,
+    profile_dir: profileDir,
+    profile_name: path.basename(profileDir),
+    url: provider.start_url,
+    brain_provider: provider.id,
+  };
+}
+
+async function waitForDebugEndpoint(port, timeoutMs = 8000) {
+  const deadline = Date.now() + Math.min(Math.max(Number(timeoutMs) || 8000, 1000), 20000);
+  while (Date.now() < deadline) {
+    try {
+      const [version, targets] = await Promise.all([
+        getJson(`http://127.0.0.1:${port}/json/version`),
+        listTargets(port),
+      ]);
+      if (version?.webSocketDebuggerUrl && Array.isArray(targets)) return { version, targets };
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  return null;
+}
+
+async function launchDedicatedBrowserIfNeeded(args = {}) {
+  if (args.auto_launch === false) return { attempted: false, launched: false };
+  if (pendingDedicatedLaunch) return pendingDedicatedLaunch;
+  pendingDedicatedLaunch = (async () => {
+    const profileDir = path.resolve(args.profile_dir || defaultProfileDir());
+    const existing = await localEdgeProcessCandidates();
+    const alreadyRunning = existing.some(candidate => candidate.userDataDir && path.resolve(candidate.userDataDir) === profileDir);
+    if (alreadyRunning) {
+      return {
+        attempted: true,
+        launched: false,
+        already_running: true,
+        browser_name: "Edge",
+        profile_dir: profileDir,
+        profile_name: path.basename(profileDir),
+        message: "dedicated browser is already running but its debugging endpoint is not ready",
+      };
+    }
+    let launch;
+    try {
+      launch = launchBrowser(args);
+    } catch (error) {
+      return { attempted: true, launched: false, error: String(error) };
+    }
+    if (!launch.launched) return { attempted: true, ...launch };
+    const endpoint = await waitForDebugEndpoint(launch.port);
+    return {
+      attempted: true,
+      ...launch,
+      ready: Boolean(endpoint),
+      message: endpoint
+        ? "dedicated browser is ready"
+        : "dedicated browser was started but its debugging endpoint is not ready yet",
+    };
+  })().finally(() => {
+    pendingDedicatedLaunch = null;
+  });
+  return pendingDedicatedLaunch;
 }
 
 async function browserStatus(args = {}) {
@@ -1393,13 +1638,799 @@ async function browserStatus(args = {}) {
   }
 }
 
+function discoveryPorts(args = {}) {
+  const values = [];
+  const add = value => {
+    const port = Number(value);
+    if (Number.isInteger(port) && port >= 1 && port <= 65535 && !values.includes(port)) values.push(port);
+  };
+  if (Array.isArray(args.ports)) args.ports.forEach(add);
+  add(args.port);
+  add(process.env.CHATGPT_BRIDGE_PORT);
+  [DEFAULT_PORT, 9223, 9224, 9225, 9333].forEach(add);
+  return values;
+}
+
+async function windowIdsForTargets(version = {}, targets = []) {
+  const url = version.webSocketDebuggerUrl;
+  const pages = targets.filter(item => item?.type === "page" && item.id);
+  if (!url || !pages.length) return {};
+  return new Promise(resolve => {
+    let ws;
+    const results = {};
+    const pendingIds = new Set();
+    const pageByRequestId = new Map();
+    let nextId = 1;
+    let timer;
+    const finish = () => {
+      if (timer) clearTimeout(timer);
+      try { ws?.close(); } catch {}
+      resolve(results);
+    };
+    try {
+      ws = new WebSocket(url);
+      ws.addEventListener("open", () => {
+        for (const page of pages) {
+          const id = nextId++;
+          pageByRequestId.set(id, page);
+          pendingIds.add(id);
+          ws.send(JSON.stringify({ id, method: "Browser.getWindowForTarget", params: { targetId: page.id } }));
+        }
+        timer = setTimeout(finish, 2500);
+      }, { once: true });
+      ws.addEventListener("message", event => {
+        try {
+          const message = JSON.parse(String(event.data));
+          if (!pendingIds.has(message.id)) return;
+          pendingIds.delete(message.id);
+          const page = pageByRequestId.get(message.id);
+          if (page && message.result?.windowId !== undefined) results[page.id] = String(message.result.windowId);
+          if (!pendingIds.size) finish();
+        } catch {}
+      });
+      ws.addEventListener("error", finish, { once: true });
+      ws.addEventListener("close", () => {
+        if (pendingIds.size) finish();
+      }, { once: true });
+    } catch {
+      finish();
+    }
+  });
+}
+
+async function activateTargetOnBrowser(version = {}, targetId = "") {
+  const url = version.webSocketDebuggerUrl;
+  if (!url || !targetId) return false;
+  return new Promise(resolve => {
+    let ws;
+    let timer;
+    const finish = value => {
+      if (timer) clearTimeout(timer);
+      try { ws?.close(); } catch {}
+      resolve(Boolean(value));
+    };
+    try {
+      ws = new WebSocket(url);
+      ws.addEventListener("open", () => {
+        timer = setTimeout(() => finish(false), 2500);
+        ws.send(JSON.stringify({ id: 1, method: "Target.activateTarget", params: { targetId } }));
+      }, { once: true });
+      ws.addEventListener("message", event => {
+        try {
+          const message = JSON.parse(String(event.data));
+          if (message.id === 1) finish(!message.error && message.result?.success !== false);
+        } catch { finish(false); }
+      });
+      ws.addEventListener("error", () => finish(false), { once: true });
+      ws.addEventListener("close", () => finish(false), { once: true });
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+async function localEdgeProcessCandidates() {
+  if (process.platform !== "win32") return [];
+  const script = "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress";
+  try {
+    const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      windowsHide: true,
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    const parsed = JSON.parse(String(stdout || "[]"));
+    const rows = Array.isArray(parsed) ? parsed : [parsed];
+    const candidates = [];
+    const seen = new Set();
+    for (const row of rows) {
+      const commandLine = String(row?.CommandLine || "");
+      if (!commandLine) continue;
+      if (/\s--type=/i.test(commandLine)) continue;
+      const profileMatch = commandLine.match(/--user-data-dir=(?:"([^"]+)"|(\S+))/i);
+      const portMatch = commandLine.match(/--remote-debugging-port=(\d+)/i);
+      const key = profileMatch?.[1] || profileMatch?.[2] || "default-profile";
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push({
+        userDataDir: key.startsWith("pid:") ? "" : key,
+        port: portMatch ? Number(portMatch[1]) : null,
+        processId: String(row?.ProcessId || ""),
+      });
+    }
+    return candidates;
+  } catch {
+    return [];
+  }
+}
+
+async function discoverBrowserInstances(args = {}) {
+  const instances = [];
+  const processCandidates = await localEdgeProcessCandidates();
+  for (const port of discoveryPorts(args)) {
+    try {
+      const [version, targets] = await Promise.all([
+        getJson(`http://127.0.0.1:${port}/json/version`).catch(() => ({})),
+        listTargets(port),
+      ]);
+      if (!Array.isArray(targets)) continue;
+      const windowByTarget = await windowIdsForTargets(version, targets);
+      instances.push(browserInstanceFromEndpoint({ port, version, targets, windowByTarget, index: instances.length + 1 }));
+    } catch {}
+  }
+  const connectedPorts = new Set(instances.map(instance => instance.port));
+  for (const candidate of processCandidates) {
+    if (candidate.port && connectedPorts.has(candidate.port)) continue;
+    instances.push(undebuggableBrowserInstance({
+      index: instances.length + 1,
+      userDataDir: candidate.userDataDir,
+      processId: candidate.processId,
+    }));
+  }
+  return instances;
+}
+
+async function discoverForUser(args = {}) {
+  let instances = await discoverBrowserInstances(args);
+  let automaticLaunch = { attempted: false, launched: false };
+  if (!instances.some(instance => instance.debugging) && args.auto_launch !== false) {
+    automaticLaunch = await launchDedicatedBrowserIfNeeded(args);
+    if (automaticLaunch.launched) instances = await discoverBrowserInstances(args);
+  }
+  return { instances, automaticLaunch };
+}
+
+function browserInstanceSelection(instances, selector = "") {
+  const wanted = String(selector || "").trim();
+  if (!wanted) {
+    const debuggable = instances.filter(instance => instance.debugging);
+    if (debuggable.length === 1) return debuggable[0];
+    const error = new Error(debuggable.length > 1
+      ? "more than one debuggable browser is available; choose a browser by number or name"
+      : "no debuggable browser was found");
+    error.code = debuggable.length > 1 ? "BROWSER_SELECTION_REQUIRED" : "BROWSER_NOT_FOUND";
+    error.browsers = publicBrowserChoices(instances);
+    throw error;
+  }
+  const numeric = /^\d+$/.test(wanted) ? Number(wanted) : null;
+  const matches = numeric
+    ? instances.filter((_, index) => index + 1 === numeric)
+    : instances.filter(instance => instance.browser_instance === wanted || instance.browser_instance.toLowerCase() === wanted.toLowerCase());
+  if (matches.length > 1) {
+    const error = new Error(`browser selector is ambiguous: ${wanted}`);
+    error.code = "BROWSER_AMBIGUOUS";
+    throw error;
+  }
+  if (!matches[0]) {
+    const error = new Error(`browser was not found: ${wanted}`);
+    error.code = "BROWSER_NOT_FOUND";
+    error.browsers = publicBrowserChoices(instances);
+    throw error;
+  }
+  return matches[0];
+}
+
+function publicBridgeLink(extra = {}) {
+  if (!activeBridgeLink) return {
+    state: "idle",
+    connected: false,
+    message: "还没有网页端连接。可以说“连接 ChatGPT 网页端”开始扫描。",
+  };
+  return {
+    state: activeBridgeLink.state,
+    connected: ["ready", "connected", "running", "awaiting_goal"].includes(activeBridgeLink.state),
+    provider: activeBridgeLink.provider,
+    browser: activeBridgeLink.browser,
+    window: activeBridgeLink.window,
+    tab: activeBridgeLink.tab,
+    conversation: activeBridgeLink.conversation,
+    mode: activeBridgeLink.config ? userFacingRelayMode(activeBridgeLink.config) : null,
+    direction: activeBridgeLink.config?.direction || null,
+    rounds: activeBridgeLink.config?.rounds ?? null,
+    goal: activeBridgeLink.goal || activeBridgeLink.config?.goal || brainState.goal || "",
+    goal_source: activeBridgeLink.config?.goal_source || brainState.goal_source || "none",
+    goal_status: activeBridgeLink.goal || activeBridgeLink.config?.goal || brainState.goal
+      ? "attached"
+      : activeBridgeLink.state === "awaiting_goal" ? "awaiting_user" : "none",
+    native_goal: activeBridgeLink.native_goal || activeRoute?.native_goal || null,
+    requires_goal: !Boolean(activeBridgeLink.goal || activeBridgeLink.config?.goal || brainState.goal)
+      && ["awaiting_goal", "connected", "ready"].includes(activeBridgeLink.state),
+    ...extra,
+  };
+}
+
+async function bridgeDiscover(args = {}) {
+  const { instances, automaticLaunch } = await discoverForUser(args);
+  const choices = publicBrowserChoices(instances);
+  const launchMessage = automaticLaunch.launched
+    ? `未发现可连接的浏览器，已自动打开专用${automaticLaunch.browser_name || "浏览器"}（${automaticLaunch.profile_name || "CodexBridgeEdge"}）。`
+    : automaticLaunch.already_running
+      ? `专用${automaticLaunch.browser_name || "浏览器"}已经在运行，但网页连接端点尚未准备好；不会重复启动浏览器，请稍后重试。`
+    : automaticLaunch.attempted && !automaticLaunch.launched
+      ? "未发现可连接的浏览器，自动启动专用 Edge 失败。"
+      : "";
+  return jsonResult([launchMessage, discoveryText(instances)].filter(Boolean).join("\n"), {
+    discovered: instances.some(instance => instance.debugging),
+    browsers: choices,
+    auto_launched: Boolean(automaticLaunch.launched),
+    auto_launch_ready: automaticLaunch.ready ?? false,
+    next: instances.some(instance => instance.debugging)
+      ? "选择浏览器和标签页后建立连接；如果网页要求登录，请登录后告诉我“登录好了”"
+      : "请重试连接，或检查 Edge 是否安装",
+  }, false);
+}
+
+async function bridgeFocus(args = {}) {
+  const instances = await discoverBrowserInstances(args);
+  let instance;
+  try {
+    instance = browserInstanceSelection(instances, args.browser);
+  } catch (error) {
+    return jsonResult(String(error), { focused: false, browsers: publicBrowserChoices(instances) }, true);
+  }
+  if (!instance.debugging) return jsonResult("这个 Edge 尚未允许网页连接，无法定位标签页", { focused: false, browser: instance.browser_instance }, true);
+  let selectedWindow;
+  let tab;
+  try {
+    selectedWindow = args.window ? selectWindow(instance, args.window) : null;
+    tab = selectedWindow ? selectTabInWindow(instance, selectedWindow.window, args.tab) : selectTab(instance, args.tab);
+  } catch (error) {
+    return jsonResult(String(error), { focused: false, browser: instance.browser_instance, windows: error.windows || [], tabs: error.tabs || [] }, true);
+  }
+  selectedWindow ||= instance.windows.find(window => window.tabs.some(candidate => candidate.target_id === tab.target_id));
+  const version = await getJson(`http://127.0.0.1:${instance.port}/json/version`).catch(() => ({}));
+  const focused = await activateTargetOnBrowser(version, tab.target_id);
+  return jsonResult(
+    focused ? `已定位到${instance.browser_instance} · ${tab.title}` : "无法定位这个标签页",
+    { focused, browser: instance.browser_instance, window: selectedWindow?.window || null, tab: { tab_index: tab.tab_index, title: tab.title, url: tab.url } },
+    !focused,
+  );
+}
+
+function internalBridgeId(prefix) {
+  return `${prefix}-${Date.now().toString(36)}-${crypto.randomUUID().replaceAll("-", "").slice(0, 8)}`;
+}
+
+function bridgeTabChoices(instance, provider, windowSelector = "") {
+  const windows = windowSelector ? [selectWindow(instance, windowSelector)] : instance.windows;
+  return windows.flatMap(window => window.tabs.map(tab => ({ ...tab, window: window.window })))
+    .filter(tab => providerMatchesUrl(provider, tab.url))
+    .map(tab => ({ window: tab.window, tab_index: tab.tab_index, title: tab.title, url: tab.url }));
+}
+
+async function bridgeConnect(args = {}) {
+  if (args.resume && activeBridgeLink) {
+    const health = await browserHealth({
+      route_id: activeBridgeLink.route_id,
+      session_id: activeBridgeLink.session_id,
+      brain_provider: activeBridgeLink.provider === "DeepSeek Web" ? "deepseek" : "chatgpt",
+      port: activeBridgeLink.port,
+    });
+    const healthy = Boolean(health.structuredContent?.healthy);
+    const hasGoal = Boolean(activeBridgeLink.goal || activeBridgeLink.config?.goal || brainState.goal);
+    activeBridgeLink.state = healthy ? (hasGoal ? "connected" : "awaiting_goal") : "waiting_for_login";
+    return jsonResult(
+      healthy
+        ? (hasGoal ? "网页端已准备好，可以继续" : "网页端已连接。请告诉我你希望 Codex 完成什么，我会把你的回答创建为本次桥接目标")
+        : "网页端仍未准备好，请在可见浏览器中完成登录或页面准备",
+      publicBridgeLink({ requires_login: !healthy, requires_goal: healthy && !hasGoal }),
+      false,
+    );
+  }
+  let config;
+  let provider;
+  try {
+    config = normalizeRelayConfig({
+      ...args,
+      goal_source: args.goal_source || (args.goal ? "explicit" : "plugin_question"),
+    });
+    provider = getBrainProvider(args.provider || args.brain_provider || DEFAULT_BRAIN_PROVIDER);
+  } catch (error) {
+    return jsonResult(String(error), { connected: false, state: "idle" }, true);
+  }
+  const { instances, automaticLaunch } = await discoverForUser(args);
+  let instance;
+  try {
+    instance = browserInstanceSelection(instances, args.browser);
+  } catch (error) {
+    return jsonResult(String(error), {
+      connected: false,
+      state: "discovering",
+      browsers: publicBrowserChoices(instances),
+      auto_launched: Boolean(automaticLaunch.launched),
+      auto_launch_ready: automaticLaunch.ready ?? false,
+    }, true);
+  }
+  if (!instance.debugging) {
+    return jsonResult("检测到 Edge，但它尚未允许网页调试连接。请在浏览器中开启网页连接，或选择专用浏览器。", {
+      connected: false,
+      state: "browser_selected",
+      browser: instance.browser_instance,
+      action: "enable_browser_debugging_or_launch_dedicated_profile",
+    }, true);
+  }
+  let selectedWindow;
+  let tab;
+  try {
+    selectedWindow = args.window ? selectWindow(instance, args.window) : null;
+    const windows = selectedWindow ? [selectedWindow] : instance.windows;
+    const allTabs = windows.flatMap(window => window.tabs.map(candidate => ({ ...candidate, window: window.window })));
+    if (args.tab) {
+      tab = selectedWindow ? selectTabInWindow(instance, selectedWindow.window, args.tab) : selectTab(instance, args.tab);
+      if (!providerMatchesUrl(provider, tab.url)) {
+        const error = new Error(`所选标签页不是 ${provider.display_name}，请选择对应网页端标签页`);
+        error.code = "BROWSER_TAB_PROVIDER_MISMATCH";
+        error.tabs = bridgeTabChoices(instance, provider, selectedWindow?.window || "");
+        throw error;
+      }
+    } else {
+      const candidates = allTabs.filter(candidate => providerMatchesUrl(provider, candidate.url));
+      if (candidates.length !== 1) {
+        const error = new Error(candidates.length
+          ? `发现多个 ${provider.display_name} 标签页，请选择一个`
+          : `没有发现 ${provider.display_name} 标签页，请先打开 ${provider.start_url}`);
+        error.code = candidates.length ? "BROWSER_TAB_SELECTION_REQUIRED" : "BROWSER_TAB_NOT_FOUND";
+        error.tabs = candidates.map(candidate => ({ window: candidate.window, tab_index: candidate.tab_index, title: candidate.title, url: candidate.url }));
+        throw error;
+      }
+      tab = candidates[0];
+    }
+    selectedWindow ||= instance.windows.find(window => window.tabs.some(candidate => candidate.target_id === tab.target_id));
+  } catch (error) {
+    return jsonResult(String(error), {
+      connected: false,
+      state: "browser_selected",
+      browser: instance.browser_instance,
+      windows: error.windows || [],
+      tabs: error.tabs || bridgeTabChoices(instance, provider, error.code?.startsWith("BROWSER_WINDOW_") ? "" : (args.window || "")),
+    }, true);
+  }
+
+  const sessionId = internalBridgeId("link-session");
+  const routeId = internalBridgeId("link-route");
+  const sessionResult = createSession({ session_id: sessionId, name: "网页端连接", brain_provider: provider.id });
+  if (sessionResult.isError) return sessionResult;
+  const routeResult = routeCreate({
+    route_id: routeId,
+    name: "网页端连接",
+    session_id: sessionId,
+    brain_provider: provider.id,
+    executor_provider: args.executor_provider,
+    executor_model: args.executor_model,
+    executor_profile: args.executor_profile,
+  });
+  if (routeResult.isError) return routeResult;
+
+  activeBridgeLink = {
+    state: "browser_selected",
+    provider_id: provider.id,
+    provider: provider.display_name,
+    browser: instance.browser_instance,
+    window: selectedWindow?.window || null,
+    tab: { tab_index: tab.tab_index, title: tab.title, url: tab.url },
+    conversation: null,
+    config,
+    session_id: sessionId,
+    route_id: routeId,
+    port: instance.port,
+  };
+  activeRelayEngine = createRelayEngine({
+    config,
+    relayId: routeId,
+    verifyDestination: () => verifyBridgeDestination(),
+    sendMessage: async envelope => {
+      const result = await askBrain({
+        route_id: routeId,
+        session_id: sessionId,
+        brain_provider: provider.id,
+        port: instance.port,
+        prompt: `[Codex Bridge Message]\nOrigin: Codex\nRelay Round: ${envelope.turn_index}\n\n<content>\n${envelope.content}\n</content>`,
+      });
+      if (result.isError) throw new Error(resultText(result));
+      return { reply: resultText(result), raw: result };
+    },
+    receiveMessage: async () => {
+      const snapshot = await pageSnapshot(provider);
+      return { content: snapshot.last, source_message_id: snapshot.url };
+    },
+    executeRound: async roundArgs => {
+      const result = await runRound({
+        route_id: routeId,
+        session_id: sessionId,
+        brain_provider: provider.id,
+        goal: roundArgs.goal,
+        context: roundArgs.context,
+        constraints: roundArgs.constraints,
+        continuous: config.mode === "continuous",
+        max_rounds: config.mode === "continuous" ? undefined : config.rounds,
+        port: instance.port,
+      });
+      return result.structuredContent || result;
+    },
+    onStateChange: next => {
+      if (!activeBridgeLink) return;
+      activeBridgeLink.state = next.state;
+      activeBridgeLink.round = next.round;
+    },
+  });
+  const opened = await openBrainBrowser({
+    route_id: routeId,
+    session_id: sessionId,
+    brain_provider: provider.id,
+    port: instance.port,
+    target_id: tab.target_id,
+  });
+  if (opened.isError) {
+    activeBridgeLink.state = "disconnected";
+    return jsonResult(resultText(opened), publicBridgeLink({ reason: "网页标签页连接失败" }), true);
+  }
+
+  if (args.conversation) {
+    const conversationArgs = /^https?:\/\//i.test(String(args.conversation))
+      ? { url: args.conversation }
+      : { title: args.conversation };
+    const selected = await selectConversation({
+      ...conversationArgs,
+      route_id: routeId,
+      session_id: sessionId,
+      brain_provider: provider.id,
+      port: instance.port,
+    });
+    if (selected.isError) {
+      activeBridgeLink.state = "paused";
+      return jsonResult(resultText(selected), publicBridgeLink({ reason: "无法确认目标对话" }), true);
+    }
+  }
+  activeBridgeLink.conversation = selectedConversation
+    ? { title: selectedConversation.title || "当前对话", url: selectedConversation.url || "" }
+    : null;
+
+  const health = await browserHealth({
+    route_id: routeId,
+    session_id: sessionId,
+    brain_provider: provider.id,
+    port: instance.port,
+  });
+  const healthy = Boolean(health.structuredContent?.healthy);
+  activeBridgeLink.state = healthy ? "awaiting_goal" : "waiting_for_login";
+  return jsonResult(
+    healthy
+      ? `${provider.display_name} 已连接：${tab.title}。请告诉我你希望 Codex 完成什么，我会把你的回答创建为本次桥接目标`
+      : `${provider.display_name} 标签页已找到，请在浏览器中登录或完成页面准备后告诉我“登录好了”`,
+    publicBridgeLink({ requires_login: !healthy, requires_goal: healthy, reason: healthy ? "等待用户回答目标问题" : "需要用户在可见浏览器中完成登录" }),
+    false,
+  );
+}
+
+function bridgeStatus() {
+  return jsonResult("网页端连接状态", publicBridgeLink());
+}
+
+async function bridgeGoalCreate(args = {}) {
+  if (!activeBridgeLink) return jsonResult("还没有建立网页端连接，无法创建目标", { goal_attached: false, state: "idle" }, true);
+  if (activeBridgeLink.state === "waiting_for_login" || activeBridgeLink.state === "disconnected") {
+    return jsonResult("网页端尚未准备好，完成登录并恢复连接后再创建目标", publicBridgeLink({ goal_attached: false, requires_login: true }), true);
+  }
+  const answer = args.answer ?? args.response ?? args.message ?? args.goal;
+  let compiled;
+  try {
+    compiled = compileUserGoal(answer);
+  } catch (error) {
+    return jsonResult(String(error), publicBridgeLink({ goal_attached: false, requires_goal: true }), true);
+  }
+  const goal = compiled.goal;
+  brainState = newBrainState();
+  brainState.goal = goal;
+  brainState.goal_source = compiled.source;
+  brainState.goal_title = compiled.title;
+  brainState.goal_compiled_at = compiled.compiled_at;
+  brainState.goal_success_criteria = compiled.success_criteria;
+  brainState.mode = activeBridgeLink.config?.mode || brainState.mode;
+  brainState.continuous = brainState.mode === "continuous";
+  brainState.maxRounds = brainState.continuous ? null : activeBridgeLink.config?.rounds ?? brainState.maxRounds;
+  brainState.startedAt = compiled.compiled_at;
+  activeBridgeLink.goal = goal;
+  activeBridgeLink.goal_ir = compiled;
+  activeBridgeLink.config = {
+    ...(activeBridgeLink.config || {}),
+    goal,
+    goal_source: compiled.source,
+  };
+  activeRelayEngine?.setGoal?.(goal);
+
+  // Bounded/continuous Brain-Hand links use a real Codex App Server worker.
+  // Set its native Goal as soon as it exists; one-shot links stay lightweight
+  // and will sync only if a worker is already bound or later starts.
+  let nativeGoal = null;
+  const route = readRoute(activeBridgeLink.route_id);
+  const requiresWorker = activeBridgeLink.config?.mode !== "one_shot";
+  if (requiresWorker && !route.codex_thread_id) {
+    const started = await codexThreadStart({
+      route_id: activeBridgeLink.route_id,
+      cwd: args.cwd || process.cwd(),
+      executor_provider: args.executor_provider,
+      executor_model: args.executor_model,
+      executor_profile: args.executor_profile,
+    });
+    if (started.isError) {
+      nativeGoal = {
+        synced: false,
+        state: "pending",
+        code: started.structuredContent?.code || "CODEX_WORKER_START_FAILED",
+        reason: resultText(started) || "Codex worker could not be started; native Goal will be retried",
+      };
+    }
+  }
+  const currentRoute = readRoute(activeBridgeLink.route_id);
+  if (currentRoute.codex_thread_id) {
+    nativeGoal = await syncCodexNativeGoal({
+      routeId: activeBridgeLink.route_id,
+      objective: goal,
+    });
+  }
+  activeBridgeLink.native_goal = nativeGoal || {
+    synced: false,
+    state: "pending",
+    code: "CODEX_WORKER_NOT_STARTED",
+    reason: "one-shot link does not start a Codex worker; native Goal sync will happen if a worker is started",
+  };
+  activeBridgeLink.state = activeBridgeLink.config.manual ? "ready" : "connected";
+  persistActiveSession();
+  syncActiveRoute({ status: activeBridgeLink.state });
+  appendRouteEvent(activeBridgeLink.route_id, {
+    type: "GOAL_ATTACHED",
+    summary: compiled.title,
+    data: {
+      source: compiled.source,
+      success_criteria: compiled.success_criteria,
+      native_goal_synced: Boolean(activeBridgeLink.native_goal?.synced),
+    },
+  });
+  const nativeMessage = activeBridgeLink.native_goal?.synced
+    ? "，并已同步到 Codex 原生 Goal"
+    : "；Codex 原生 Goal 将在 Worker 启动后重试同步";
+  return jsonResult(`已创建并挂载目标：${compiled.title}${nativeMessage}`, publicBridgeLink({
+    goal_attached: true,
+    goal,
+    goal_title: compiled.title,
+    goal_source: compiled.source,
+    goal_ir: compiled,
+    native_goal: activeBridgeLink.native_goal,
+    requires_goal: false,
+  }));
+}
+
+async function verifyBridgeDestination() {
+  if (!activeBridgeLink || !activeSession?.target_id) {
+    const error = new Error("网页端连接还没有绑定可验证的标签页");
+    error.code = "DESTINATION_NOT_BOUND";
+    throw error;
+  }
+  const providerId = activeBridgeLink.provider_id || (activeBridgeLink.provider === "DeepSeek Web" ? "deepseek" : "chatgpt");
+  const provider = getBrainProvider(providerId);
+  const targets = await listTargets(activeBridgeLink.port);
+  const page = targets.find(item => item.type === "page" && item.id === activeSession.target_id);
+  if (!page) {
+    const error = new Error("目标标签页已关闭或浏览器连接已断开");
+    error.code = "BROWSER_TARGET_DISCONNECTED";
+    throw error;
+  }
+  if (!providerMatchesUrl(provider, page.url)) {
+    const error = new Error(`目标标签页已切换到非 ${provider.display_name} 页面`);
+    error.code = "DESTINATION_PROVIDER_MISMATCH";
+    throw error;
+  }
+  await ensureConnected(activeBridgeLink.port, activeSession, provider);
+  const current = await currentConversationData(provider);
+  const expected = activeBridgeLink.conversation;
+  const conversationMismatch = expected && (
+    !current.is_conversation
+    || (expected.url && expected.url !== current.url)
+    || (!expected.url && expected.title && expected.title !== current.title)
+  );
+  if (conversationMismatch) {
+    const error = new Error(`目标对话发生变化：原为“${expected.title || expected.url}”，当前为“${current.title || current.url}”`);
+    error.code = "DESTINATION_CONVERSATION_MISMATCH";
+    error.expected = expected;
+    error.actual = current;
+    throw error;
+  }
+  if (!expected && current.is_conversation) {
+    activeBridgeLink.conversation = { title: current.title || "当前对话", url: current.url || "" };
+  }
+  return { provider, page, current };
+}
+
+async function bridgeSend(args = {}) {
+  if (!activeBridgeLink) return jsonResult("还没有建立网页端连接", { sent: false, state: "idle" }, true);
+  if (!activeBridgeLink.goal && !activeBridgeLink.config?.goal && !brainState.goal) {
+    return jsonResult("连接已建立，请先回答“你希望 Codex 完成什么？”，再发送网页消息", publicBridgeLink({ sent: false, requires_goal: true }), true);
+  }
+  if (activeBridgeLink.config?.direction === "web_to_codex") {
+    return jsonResult("当前连接方向是网页端 → Codex，请使用接收操作；未向网页端发送内容", publicBridgeLink({ sent: false, direction: "web_to_codex" }), true);
+  }
+  const prompt = String(args.message ?? args.prompt ?? "").trim();
+  if (!prompt) return jsonResult("请提供要发送给网页端的内容", publicBridgeLink({ sent: false }), true);
+  try {
+    const result = await activeRelayEngine.send({
+      content: prompt,
+      provider: activeBridgeLink.provider_id,
+      conversationId: selectedConversation?.id,
+      conversationTitle: selectedConversation?.title,
+      turnIndex: activeBridgeLink.round || 0,
+    });
+    if (!result.sent) {
+      return jsonResult(result.reason || "网页端消息未发送", publicBridgeLink({ sent: false, reason: result.reason || "连接未处于可发送状态" }), true);
+    }
+    const reply = result.result?.reply || "";
+    const envelope = createMessageEnvelope({
+      origin: activeBridgeLink.provider_id === "deepseek" ? "web_deepseek" : "web_chatgpt",
+      provider: activeBridgeLink.provider_id,
+      conversationId: selectedConversation?.id,
+      conversationTitle: selectedConversation?.title,
+      relayId: activeBridgeLink.route_id,
+      turnIndex: activeBridgeLink.round || 0,
+      content: reply,
+    });
+    return jsonResult(reply, publicBridgeLink({ sent: true, reply, message: envelope, state: activeBridgeLink.state }));
+  } catch (error) {
+    activeBridgeLink.state = "paused";
+    return jsonResult(String(error), publicBridgeLink({
+      sent: false,
+      reason: "目标不一致，未发送任何内容",
+      expected_conversation: error.expected || activeBridgeLink.conversation,
+      actual_conversation: error.actual || null,
+    }), true);
+  }
+}
+
+async function bridgeReceive() {
+  if (!activeBridgeLink) return jsonResult("还没有建立网页端连接", { received: false, state: "idle" }, true);
+  if (!activeBridgeLink.goal && !activeBridgeLink.config?.goal && !brainState.goal) {
+    return jsonResult("连接已建立，请先回答“你希望 Codex 完成什么？”，再读取网页消息", publicBridgeLink({ received: false, requires_goal: true }), true);
+  }
+  try {
+    const result = await activeRelayEngine.receive({
+      provider: activeBridgeLink.provider_id,
+      conversationId: selectedConversation?.id,
+      conversationTitle: selectedConversation?.title,
+      sourceMessageId: selectedConversation?.url,
+      turnIndex: activeBridgeLink.round || 0,
+    });
+    if (!result.received) return jsonResult("网页端暂无新消息", publicBridgeLink({ received: false, new_message: false }));
+    return jsonResult(result.envelope.content, publicBridgeLink({ received: true, new_message: true, message: result.envelope }));
+  } catch (error) {
+    activeBridgeLink.state = "paused";
+    return jsonResult(String(error), publicBridgeLink({ received: false, reason: "目标不一致，未读取新消息" }), true);
+  }
+}
+
+async function bridgeRun(args = {}) {
+  if (!activeBridgeLink) return jsonResult("还没有建立网页端连接", { started: false, state: "idle" }, true);
+  const config = activeBridgeLink.config || normalizeRelayConfig(args);
+  const goal = String(args.goal || config.goal || "").trim();
+  if (!goal) {
+    return jsonResult(
+      "网页端已连接，请先回答 Codex 的目标问题；插件会用你的回答创建本次 Brain-Hand 目标",
+      publicBridgeLink({ started: false, requires_goal: true }),
+      true,
+    );
+  }
+  const route = readRoute(activeBridgeLink.route_id);
+  if (!route.codex_thread_id) {
+    const started = await codexThreadStart({
+      route_id: activeBridgeLink.route_id,
+      cwd: args.cwd || process.cwd(),
+      executor_provider: args.executor_provider,
+      executor_model: args.executor_model,
+      executor_profile: args.executor_profile,
+    });
+    if (started.isError) return started;
+  }
+  const nativeGoal = await syncCodexNativeGoal({
+    routeId: activeBridgeLink.route_id,
+    objective: goal,
+  });
+  activeBridgeLink.native_goal = nativeGoal;
+  const result = await activeRelayEngine.run({
+    goal,
+    context: args.context,
+    constraints: args.constraints,
+    cwd: args.cwd,
+    executor_provider: args.executor_provider,
+    executor_model: args.executor_model,
+    executor_profile: args.executor_profile,
+    safety_limit: args.safety_limit,
+  });
+  return jsonResult(result.status ? `网页端循环状态：${result.status}` : "网页端连接已准备好", publicBridgeLink({
+    started: Boolean(result.started),
+    result,
+    native_goal: nativeGoal,
+    state: activeBridgeLink.state,
+  }), false);
+}
+
+async function bridgePause() {
+  if (!activeBridgeLink || !activeRelayEngine) return jsonResult("还没有建立网页端连接", { paused: false, state: "idle" }, true);
+  const state = await activeRelayEngine.pause("user pause");
+  activeBridgeLink.state = "paused";
+  return jsonResult("网页端连接已暂停", publicBridgeLink({ paused: true, state: state.state }));
+}
+
+async function bridgeDisconnect() {
+  if (!activeBridgeLink) return jsonResult("还没有建立网页端连接", { disconnected: false, state: "idle" }, true);
+  if (activeRelayEngine) await activeRelayEngine.stop("user disconnect");
+  closeSocket();
+  activeBridgeLink.state = "disconnected";
+  return jsonResult("网页端连接已断开", publicBridgeLink({ disconnected: true, state: "disconnected" }));
+}
+
+async function bridgeExternalPanel(args = {}) {
+  const requestedPort = Number(args.port || process.env.CODEX_BRIDGE_PANEL_PORT || 17841);
+  const port = Number.isInteger(requestedPort) && requestedPort >= 1024 && requestedPort <= 65535 ? requestedPort : 17841;
+  if (activePanel) return jsonResult(`面板已打开：${activePanel.url}`, {
+    opened: true,
+    url: activePanel.url,
+    panel_id: activePanel.panelId,
+    codex_conversation_label: activePanel.label,
+  });
+  const token = crypto.randomBytes(24).toString("hex");
+  const label = String(args.label || "当前 Codex 对话").trim().slice(0, 100) || "当前 Codex 对话";
+  try {
+    activePanel = await createPanelServer({
+      port,
+      token,
+      label,
+      open: args.open !== false,
+      callTool: (name, toolArgs) => callToolDirect(name, toolArgs),
+    });
+  } catch (error) {
+    activePanel = null;
+    return jsonResult(`无法启动本地面板：${String(error)}`, { opened: false }, true);
+  }
+  return jsonResult(`面板已打开：${activePanel.url}`, {
+    opened: true,
+    url: activePanel.url,
+    panel_id: activePanel.panelId,
+    codex_conversation_label: activePanel.label,
+  });
+}
+
+async function bridgePanel(args = {}) {
+  if (args.external === true) return bridgeExternalPanel(args);
+  return nativeUiResult("已在当前 Codex 对话中打开网页桥接面板。", {
+    native_ui: true,
+    conversation_scope: "current_codex_conversation",
+    message: "这是当前 Codex 对话内的桥接面板；它不会与其他 Codex 对话共享可见的 UI 状态。",
+    bridge: publicBridgeLink(),
+  });
+}
+
 async function browserHealth(args = {}) {
   const port = portOf(args);
   const provider = brainProviderOf(args);
   try {
     ensureActiveSession(args);
     await ensureConnected(port, activeSession, provider);
-    const health = await evaluate(selectorHealthScript(provider.id));
+    const health = await evaluate(getWebLLMAdapter(provider.id).selectorHealthScript());
     return jsonResult(`${provider.display_name} adapter health: ${health?.ok ? "ok" : "degraded"}`, {
       healthy: Boolean(health?.ok),
       brain_provider: provider.id,
@@ -1416,20 +2447,30 @@ async function openBrainBrowser(args = {}) {
   activateRoute(args);
   const port = portOf(args);
   const provider = brainProviderOf(args);
+  const explicitTarget = Boolean(args.target_id || args.targetId || args.target_title || args.targetTitle || args.target_url || args.targetUrl);
   let page;
   try {
-    page = await findBrainTarget(port, activeSession, provider);
+    page = await findBrainTarget(port, activeSession, provider, args);
   } catch (error) {
     return jsonResult(String(error), { opened: false, port }, true);
   }
-  if (!page) {
+  if (!page && !activeSession?.target_id && !explicitTarget) {
     try {
-      page = await createBrainTarget(port, provider);
+      page = await createBrainTarget(port, provider, activeSession);
     } catch {}
   }
-  if (!page) return jsonResult(`open ${provider.start_url} manually in the remote-debug browser`, { opened: false, port }, true);
+  if (!page) {
+    return jsonResult(
+      activeSession?.target_id
+        ? "the bound browser tab is unavailable; no replacement tab was opened automatically"
+        : `open ${provider.start_url} manually in the remote-debug browser`,
+      { opened: false, port, target_preserved: Boolean(activeSession?.target_id), recovery_required: Boolean(activeSession?.target_id) },
+      true,
+    );
+  }
   try {
     await connectToTarget(page);
+    try { await cdpRaw("Page.bringToFront", {}); } catch {}
     if (!providerMatchesUrl(provider, page.url)) await cdpRaw("Page.navigate", { url: provider.start_url });
     try {
       const current = await currentConversationData(provider);
@@ -1453,9 +2494,11 @@ async function openBrainBrowser(args = {}) {
 }
 
 async function pageSnapshot(provider = brainProviderOf()) {
-  const assistantSelectors = JSON.stringify(provider.assistant_selectors);
-  const generatingTerms = JSON.stringify(provider.generating_terms);
-  const loginTerms = JSON.stringify(provider.login_terms);
+  const adapter = getWebLLMAdapter(provider.id);
+  const profile = adapter.profile;
+  const assistantSelectors = JSON.stringify(profile.assistant_selectors);
+  const generatingTerms = JSON.stringify(profile.generating_terms);
+  const loginTerms = JSON.stringify(profile.login_terms);
   return evaluate(`(() => {
     const assistantSelectors = ${assistantSelectors};
     const assistantNodes = assistantSelectors.flatMap(selector => [...document.querySelectorAll(selector)]);
@@ -1470,9 +2513,69 @@ async function pageSnapshot(provider = brainProviderOf()) {
     const generating = streamingMarkup || generatingTerms.some(term => buttonText.includes(term.toLowerCase()));
     const bodyText = (document.body?.innerText || '').slice(0, 3000);
     const lowerBody = bodyText.toLowerCase();
-    const loginRequired = location.pathname.includes('/auth/') || ${JSON.stringify(provider.login_terms)}.some(term => lowerBody.includes(term.toLowerCase()));
+    const loginRequired = location.pathname.includes('/auth/') || ${loginTerms}.some(term => lowerBody.includes(term.toLowerCase()));
     return { url: location.href, loginRequired, messages, last: messages.at(-1) || '', generating };
   })()`);
+}
+
+async function refreshBoundBrowserTab(port, provider, timeoutMs = 15000) {
+  const boundTargetId = activeSession?.target_id;
+  if (!boundTargetId) {
+    const error = new Error("cannot refresh a browser tab before a target is bound");
+    error.code = "DESTINATION_NOT_BOUND";
+    throw error;
+  }
+
+  // Reconnect only to the persisted target. The recovery path is deliberately
+  // not allowed to call createBrainTarget or fall through to another page.
+  await ensureConnected(port, activeSession, provider, { allowCreate: false });
+  if (target?.id !== boundTargetId) {
+    const error = new Error("the bound browser tab changed; no replacement tab was opened");
+    error.code = "BROWSER_TARGET_CHANGED";
+    throw error;
+  }
+
+  try {
+    await cdpRaw("Page.reload", { ignoreCache: false });
+  } catch (firstError) {
+    // A reload can close the current DevTools socket while leaving the same
+    // page alive. Reattach to that same target once, never to a new one.
+    await ensureConnected(port, activeSession, provider, { allowCreate: false });
+    try {
+      await cdpRaw("Page.reload", { ignoreCache: false });
+    } catch {
+      throw firstError;
+    }
+  }
+
+  const deadline = Date.now() + Math.min(Math.max(Number(timeoutMs) || 15000, 3000), 20000);
+  let lastHealth = null;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 400));
+    const pages = await listTargets(port);
+    const page = pages.find(item => item.type === "page" && item.id === boundTargetId);
+    if (!page) {
+      const error = new Error("the bound browser tab was closed during same-tab refresh");
+      error.code = "BROWSER_TARGET_DISCONNECTED";
+      throw error;
+    }
+    if (!providerMatchesUrl(provider, page.url)) {
+      const error = new Error(`the bound browser tab changed to a non-${provider.display_name} page`);
+      error.code = "DESTINATION_PROVIDER_MISMATCH";
+      throw error;
+    }
+    try {
+      await ensureConnected(port, activeSession, provider, { allowCreate: false });
+      lastHealth = await evaluate(getWebLLMAdapter(provider.id).selectorHealthScript());
+      if (lastHealth?.ok) return { refreshed: true, healthy: true, strategies: lastHealth.strategies || [] };
+    } catch (error) {
+      lastHealth = { ok: false, reason: String(error) };
+    }
+  }
+  const error = new Error("same-tab refresh completed, but the web composer is still unavailable");
+  error.code = "WEB_UI_CHANGED";
+  error.health = lastHealth;
+  throw error;
 }
 
 async function askBrain(args = {}) {
@@ -1480,25 +2583,70 @@ async function askBrain(args = {}) {
   if (!prompt) return jsonResult("prompt is required", { sent: false }, true);
   const port = portOf(args);
   const provider = brainProviderOf(args);
+  const adapter = getWebLLMAdapter(provider.id);
+  const profile = adapter.profile;
   const timeoutMs = Math.min(Math.max(Number(args.timeout_ms || 120000), 10000), 300000);
   try {
     ensureActiveSession(args);
+    if (activeBridgeLink?.route_id === activeRouteId) await verifyBridgeDestination();
     await ensureConnected(port, activeSession, provider);
-    const before = await pageSnapshot(provider);
+    let before = await pageSnapshot(provider);
     if (before.loginRequired) {
       return jsonResult(`${provider.display_name} requires manual sign-in in the dedicated browser`, { sent: false, url: before.url, brain_provider: provider.id }, true);
     }
-    const promptLiteral = JSON.stringify(prompt);
-    const inputSelectorsLiteral = JSON.stringify(provider.input_selectors);
-    const prepared = await evaluate(`(() => {
-      const value = ${promptLiteral};
+    const inputSelectorsLiteral = JSON.stringify(profile.input_selectors);
+    const preparePrompt = () => evaluate(`(() => {
       const selectors = ${inputSelectorsLiteral};
+      const sendSelectors = ${JSON.stringify(profile.send_selectors)};
+      const sendTerms = ${JSON.stringify(profile.send_terms)};
       const input = selectors.map(selector => document.querySelector(selector)).find(Boolean);
+      const buttons = [...document.querySelectorAll('button')];
+      const send = sendSelectors.map(selector => document.querySelector(selector)).find(Boolean)
+        || buttons.find(button => {
+          const label = ((button.getAttribute('aria-label') || '') + ' ' + (button.innerText || '')).toLowerCase();
+          return sendTerms.some(term => label.includes(term.toLowerCase()));
+        });
       if (!input) return { ok: false, reason: 'input-not-found' };
+      if (!send) return { ok: false, reason: 'send-button-not-found', target_preserved: true };
       input.focus();
       return { ok: true, tag: input.tagName, contenteditable: input.isContentEditable };
     })()`);
-    if (!prepared?.ok) return jsonResult(`could not prepare prompt: ${prepared?.reason || "unknown"}`, { sent: false }, true);
+    let prepared = await preparePrompt();
+    let refreshedSameTab = false;
+    if (!prepared?.ok && ["input-not-found", "send-button-not-found"].includes(prepared?.reason)) {
+      try {
+        await refreshBoundBrowserTab(port, provider, Math.min(timeoutMs, 15000));
+        refreshedSameTab = true;
+        before = await pageSnapshot(provider);
+        if (before.loginRequired) {
+          return jsonResult(`${provider.display_name} requires manual sign-in after same-tab refresh`, {
+            sent: false,
+            refreshed_same_tab: true,
+            replacement_opened: false,
+            url: before.url,
+            brain_provider: provider.id,
+          }, true);
+        }
+        prepared = await preparePrompt();
+      } catch (error) {
+        return jsonResult(`web composer unavailable after refreshing the same tab: ${String(error)}` , {
+          sent: false,
+          reason: error.code || "same_tab_refresh_failed",
+          refreshed_same_tab: true,
+          replacement_opened: false,
+          browser_target_id: activeSession?.target_id || null,
+        }, true);
+      }
+    }
+    if (!prepared?.ok) return jsonResult(
+      refreshedSameTab
+        ? `could not submit prompt after refreshing the same tab: ${prepared?.reason || "web UI changed"}; no new tab was opened`
+        : prepared?.reason === "send-button-not-found"
+          ? `could not submit prompt: send button not found; the bound tab was preserved and no new tab was opened`
+        : `could not prepare prompt: ${prepared?.reason || "unknown"}`,
+      { sent: false, reason: prepared?.reason || "unknown", target_preserved: prepared?.target_preserved !== false, replacement_opened: false, refreshed_same_tab: refreshedSameTab, browser_target_id: activeSession?.target_id || null },
+      true,
+    );
 
     await cdpRaw("Input.dispatchKeyEvent", { type: "keyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
     await cdpRaw("Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
@@ -1506,9 +2654,9 @@ async function askBrain(args = {}) {
     await cdpRaw("Input.dispatchKeyEvent", { type: "keyUp", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
     await cdpRaw("Input.insertText", { text: prompt });
     await new Promise(resolve => setTimeout(resolve, 250));
-    const sendSelectorsLiteral = JSON.stringify(provider.send_selectors);
-    const sendTermsLiteral = JSON.stringify(provider.send_terms);
-    const generatingTermsLiteral = JSON.stringify(provider.generating_terms);
+    const sendSelectorsLiteral = JSON.stringify(profile.send_selectors);
+    const sendTermsLiteral = JSON.stringify(profile.send_terms);
+    const generatingTermsLiteral = JSON.stringify(profile.generating_terms);
     const sent = await evaluate(`(() => {
       const buttons = [...document.querySelectorAll('button')];
       const selectors = ${sendSelectorsLiteral};
@@ -1550,6 +2698,105 @@ async function askBrain(args = {}) {
 }
 
 const TOOLS = [
+  {
+    name: "bridge_discover",
+    description: "Scan for visible Edge/Chrome browser instances, automatically start the dedicated persistent Edge profile when none is connectable, and present browsers, windows, and tabs in human terms. Technical IDs remain internal.",
+    inputSchema: { type: "object", properties: {
+      provider: { type: "string", enum: listBrainProviders().map(provider => provider.id), default: DEFAULT_BRAIN_PROVIDER, description: "Web brain to open automatically when no debuggable browser is available." },
+      auto_launch: { type: "boolean", default: true, description: "Automatically start the dedicated persistent Edge profile when no debuggable browser is available." },
+    } },
+  },
+  {
+    name: "bridge_connect",
+    description: "Connect this Codex conversation to a selected visible web AI. If no debuggable browser is available, automatically start the dedicated persistent Edge profile. Choose by provider, browser name, tab number/title, conversation title, and relay mode; the bridge manages internal routing IDs.",
+    inputSchema: { type: "object", properties: {
+      provider: { type: "string", enum: listBrainProviders().map(provider => provider.id), default: DEFAULT_BRAIN_PROVIDER },
+      browser: { type: "string", description: "Human browser choice such as Edge 浏览器 1. Omit when only one browser is available." },
+      window: { type: "string", description: "Human window choice such as 窗口 1 or 1. Required when multiple windows make the tab number ambiguous." },
+      tab: { type: "string", description: "Human tab number, exact title, or exact URL." },
+      conversation: { type: "string", description: "Visible conversation title, ID, or provider URL." },
+      mode: { type: "string", enum: ["one_shot", "bounded", "continuous"], default: "one_shot" },
+      rounds: { type: "integer", minimum: 0, maximum: 50, default: 1, description: "0 means manual linked mode; 1-50 means bounded relay rounds." },
+      direction: { type: "string", enum: ["codex_to_web", "web_to_codex"], default: "codex_to_web" },
+      goal: { type: "string", description: "Internal compiled bridge goal created from the user's answer after connection. The user should not enter a goal in the panel." },
+      goal_source: { type: "string", enum: ["plugin_question", "codex_conversation", "explicit"], default: "plugin_question", description: "The goal source. By default the bridge asks the user for a goal after connection and compiles the answer." },
+      auto_launch: { type: "boolean", default: true, description: "Automatically start the dedicated persistent Edge profile when no debuggable browser is available." },
+      resume: { type: "boolean", description: "Re-check the current pending browser connection after the user finishes login or page preparation." },
+      executor_provider: executorProviderSchema({ includeDefault: true }),
+      executor_model: executorModelSchema(),
+      executor_profile: executorProfileSchema(),
+    } },
+  },
+  {
+    name: "bridge_status",
+    description: "Show the current user-facing web connection, browser, tab, conversation, mode, and relay state without exposing technical IDs.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "bridge_goal_create",
+    description: "After a web connection is ready, turn the user's answer to the built-in goal question into a bounded bridge goal and attach it to the current bridge task. The panel never creates a goal.",
+    inputSchema: { type: "object", properties: {
+      answer: { type: "string", description: "The user's answer describing what Codex should accomplish." },
+    }, required: ["answer"] },
+  },
+  {
+    name: "bridge_focus",
+    description: "Bring a selected human-named browser tab to the foreground for visual confirmation without exposing DevTools IDs.",
+    inputSchema: { type: "object", properties: {
+      browser: { type: "string" },
+      window: { type: "string" },
+      tab: { type: "string" },
+    } },
+  },
+  {
+    name: "bridge_send",
+    description: "Send one explicit Codex message through the active web connection and return the visible web reply with peer-origin metadata.",
+    inputSchema: { type: "object", properties: {
+      message: { type: "string" },
+      timeout_ms: { type: "integer", default: 120000 },
+    }, required: ["message"] },
+  },
+  {
+    name: "bridge_receive",
+    description: "Read one new visible assistant message from the active web connection without sending a prompt. Deduplicates repeated web replies and marks the peer origin.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "bridge_run",
+    description: "Run the active web connection as a bounded or continuous Brain-Hand relay using the current Codex conversation goal. The bridge supplies internal route/session IDs and stops on mismatch, blocker, repetition, evidence failure, or the configured safety limit.",
+    inputSchema: { type: "object", properties: {
+      goal: { type: "string", description: "Internal compiled bridge goal created by bridge_goal_create; do not invent a separate UI goal." },
+      context: { type: "string" },
+      constraints: { type: "array", items: { type: "string" } },
+      cwd: { type: "string" },
+      executor_provider: executorProviderSchema(),
+      executor_model: executorModelSchema(),
+      executor_profile: executorProfileSchema(),
+      timeout_ms: { type: "integer", default: 120000 },
+      safety_limit: { type: "integer", minimum: 1, maximum: 10000, default: 1000 },
+    } },
+  },
+  {
+    name: "bridge_pause",
+    description: "Pause the active web connection without switching its browser tab or conversation.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "bridge_disconnect",
+    description: "Disconnect the active web connection and stop its relay state.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "bridge_panel",
+    description: "Render a native in-conversation status panel showing only the Codex ↔ web connection state and selected destination. Connection, goal creation, and relay mode are controlled through the Codex conversation. Set external=true only when the current host does not render MCP Apps UI.",
+    inputSchema: { type: "object", properties: {
+      port: { type: "integer", minimum: 1024, maximum: 65535, default: 17841 },
+      open: { type: "boolean", default: true },
+      label: { type: "string", description: "Human-readable label for the Codex conversation that opened this panel, for example '论文研究'." },
+      external: { type: "boolean", default: false, description: "Use the legacy loopback browser panel only when native MCP Apps UI is unavailable." },
+    } },
+    _meta: { ui: { resourceUri: MCP_UI_RESOURCE_URI, prefersBorder: true }, "openai/toolInvocation/invoking": "正在打开 Codex 内置连接状态面板…", "openai/toolInvocation/invoked": "Codex 内置连接状态面板已打开" },
+  },
   {
     name: "bridge_route_create",
     description: "Create a lightweight Control Plane route that maps one executor thread to one selected web brain session/tab. The Codex Adapter can drive the bound thread through App Server.",
@@ -1694,7 +2941,12 @@ const TOOLS = [
   {
     name: "chatgpt_browser_open",
     description: "Open or connect to a visible selected web brain page in the remote-debug browser. Use before asking if no page is connected.",
-    inputSchema: { type: "object", properties: { port: { type: "integer", default: DEFAULT_PORT } } },
+    inputSchema: { type: "object", properties: {
+      port: { type: "integer", default: DEFAULT_PORT },
+      target_id: { type: "string", description: "Optional exact DevTools target ID from browser status. Binds this session to that visible tab instead of auto-selecting another page." },
+      target_title: { type: "string", description: "Optional exact visible tab title. Use only when it is unique; target_id is more stable." },
+      target_url: { type: "string", description: "Optional exact visible tab URL. Use only when it is unique; target_id is more stable." },
+    } },
   },
   {
     name: "chatgpt_browser_list_conversations",
@@ -1732,6 +2984,7 @@ const TOOLS = [
       context: { type: "string" },
       constraints: { type: "array", items: { type: "string" } },
       max_rounds: { type: "integer", default: DEFAULT_MAX_ROUNDS, maximum: HARD_MAX_ROUNDS },
+      continuous: { type: "boolean", default: false },
       port: { type: "integer", default: DEFAULT_PORT },
       timeout_ms: { type: "integer", default: 120000 },
     }, required: ["goal"] },
@@ -1781,6 +3034,7 @@ const TOOLS = [
       blockers: { type: "array", items: { type: "string" } },
       evidence: { type: "array", items: { type: "string" } },
       max_rounds: { type: "integer", maximum: HARD_MAX_ROUNDS },
+      continuous: { type: "boolean", default: false },
       review: { type: "boolean", default: false },
       port: { type: "integer", default: DEFAULT_PORT },
       timeout_ms: { type: "integer", default: 120000 },
@@ -1795,6 +3049,7 @@ const TOOLS = [
       context: { type: "string" },
       constraints: { type: "array", items: { type: "string" } },
       max_rounds: { type: "integer", maximum: HARD_MAX_ROUNDS },
+      continuous: { type: "boolean", default: false },
       cwd: { type: "string" },
       model: { type: "string" },
       executor_provider: executorProviderSchema(),
@@ -1802,6 +3057,7 @@ const TOOLS = [
       executor_profile: executorProfileSchema(),
       effort: { type: "string" },
       timeout_ms: { type: "integer", default: 120000 },
+      safety_limit: { type: "integer", minimum: 1, maximum: 10000, default: 1000 },
       port: { type: "integer", default: DEFAULT_PORT },
     }, required: ["route_id"] },
   },
@@ -1814,6 +3070,7 @@ const TOOLS = [
       context: { type: "string" },
       constraints: { type: "array", items: { type: "string" } },
       max_rounds: { type: "integer", default: DEFAULT_MAX_ROUNDS, maximum: HARD_MAX_ROUNDS },
+      continuous: { type: "boolean", default: false },
       cwd: { type: "string" },
       model: { type: "string" },
       executor_provider: executorProviderSchema(),
@@ -1821,6 +3078,7 @@ const TOOLS = [
       executor_profile: executorProfileSchema(),
       effort: { type: "string" },
       timeout_ms: { type: "integer", default: 120000 },
+      safety_limit: { type: "integer", minimum: 1, maximum: 10000, default: 1000 },
       port: { type: "integer", default: DEFAULT_PORT },
     }, required: ["route_id"] },
   },
@@ -1871,8 +3129,9 @@ for (const [alias, sourceName] of BRAIN_TOOL_ALIASES) {
   });
 }
 
+const PUBLIC_BRIDGE_TOOLS = new Set(["bridge_discover", "bridge_connect", "bridge_goal_create", "bridge_status", "bridge_focus", "bridge_send", "bridge_receive", "bridge_run", "bridge_pause", "bridge_disconnect", "bridge_panel"]);
 for (const tool of TOOLS) {
-  if (!tool.inputSchema?.properties || tool.name === "brain_provider_list" || tool.name === "executor_provider_list" || tool.name.includes("session_") || tool.name.startsWith("bridge_route_")) continue;
+  if (!tool.inputSchema?.properties || PUBLIC_BRIDGE_TOOLS.has(tool.name) || tool.name === "brain_provider_list" || tool.name === "executor_provider_list" || tool.name.includes("session_") || tool.name.startsWith("bridge_route_")) continue;
   tool.inputSchema.properties.session_id = {
     type: "string",
     default: DEFAULT_SESSION_ID,
@@ -1912,6 +3171,17 @@ const ROUTED_TOOLS = new Set([
 ]);
 
 async function callToolDirect(name, args) {
+  if (name === "bridge_discover") return bridgeDiscover(args);
+  if (name === "bridge_connect") return bridgeConnect(args);
+  if (name === "bridge_goal_create") return bridgeGoalCreate(args);
+  if (name === "bridge_status") return bridgeStatus(args);
+  if (name === "bridge_focus") return bridgeFocus(args);
+  if (name === "bridge_send") return bridgeSend(args);
+  if (name === "bridge_receive") return bridgeReceive(args);
+  if (name === "bridge_run") return bridgeRun(args);
+  if (name === "bridge_pause") return bridgePause(args);
+  if (name === "bridge_disconnect") return bridgeDisconnect(args);
+  if (name === "bridge_panel") return bridgePanel(args);
   if (name === "brain_provider_list") return brainProviderList();
   if (name === "executor_provider_list") return executorProviderList();
   if (name === "bridge_route_create") return routeCreate(args);
@@ -1963,9 +3233,28 @@ async function callTool(name, args) {
 
 async function handle(message) {
   if (!message.id) return null;
-  if (message.method === "initialize") return { jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: SERVER_NAME, version: SERVER_VERSION } } };
+  if (message.method === "initialize") return { jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2025-03-26", capabilities: { tools: {}, resources: { listChanged: false, read: true } }, serverInfo: { name: SERVER_NAME, version: SERVER_VERSION } } };
   if (message.method === "ping") return { jsonrpc: "2.0", id: message.id, result: {} };
   if (message.method === "tools/list") return { jsonrpc: "2.0", id: message.id, result: { tools: TOOLS } };
+  if (message.method === "resources/list") return { jsonrpc: "2.0", id: message.id, result: { resources: [nativeUiResource()] } };
+  if (message.method === "resources/read") {
+    const uri = String(message.params?.uri || "");
+    if (uri !== MCP_UI_RESOURCE_URI) {
+      return { jsonrpc: "2.0", id: message.id, error: { code: -32602, message: `unknown resource: ${uri}` } };
+    }
+    return {
+      jsonrpc: "2.0",
+      id: message.id,
+      result: {
+        contents: [{
+          uri: MCP_UI_RESOURCE_URI,
+          mimeType: MCP_UI_RESOURCE_MIME,
+          text: readNativeUiHtml(),
+          _meta: { ui: { prefersBorder: true } },
+        }],
+      },
+    };
+  }
   if (message.method === "tools/call") {
     const params = message.params || {};
     return { jsonrpc: "2.0", id: message.id, result: await callTool(params.name, params.arguments || {}) };

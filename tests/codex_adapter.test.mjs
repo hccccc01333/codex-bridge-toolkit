@@ -28,6 +28,19 @@ class FakeCodexProcess extends EventEmitter {
         }, 5);
       } else if (message.method === "thread/read") {
         this.reply({ jsonrpc: "2.0", id: message.id, result: { thread: { id: message.params.threadId } } });
+      } else if (message.method === "thread/goal/set") {
+        this.reply({ jsonrpc: "2.0", id: message.id, result: {
+          goal: {
+            threadId: message.params.threadId,
+            objective: message.params.objective,
+            status: message.params.status,
+            tokenBudget: message.params.tokenBudget || null,
+          },
+        } });
+      } else if (message.method === "thread/goal/get") {
+        this.reply({ jsonrpc: "2.0", id: message.id, result: { goal: { threadId: message.params.threadId, status: "active" } } });
+      } else if (message.method === "thread/goal/clear") {
+        this.reply({ jsonrpc: "2.0", id: message.id, result: { cleared: true } });
       }
       return true;
     };
@@ -51,6 +64,29 @@ test("Codex Adapter starts a thread and completes a turn through app-server prot
   assert.equal(result.thread_id, "thread-test");
   assert.equal(result.text, "done");
   assert.equal(adapter.status().state, "ready");
+  adapter.close();
+});
+
+test("Codex Adapter writes and reads a native thread goal through app-server", async () => {
+  const adapter = new CodexAdapter({ spawnImpl: () => new FakeCodexProcess(), timeoutMs: 1000 });
+  const thread = await adapter.startThread({ cwd: process.cwd() });
+  const set = await adapter.setThreadGoal({
+    thread_id: thread.thread_id,
+    objective: "完成迁移并保留测试证据",
+    status: "active",
+    tokenBudget: 40000,
+  });
+  assert.equal(set.goal.threadId, "thread-test");
+  assert.equal(set.goal.objective, "完成迁移并保留测试证据");
+  assert.equal(set.goal.tokenBudget, 40000);
+  const read = await adapter.getThreadGoal(thread.thread_id);
+  assert.equal(read.goal.threadId, "thread-test");
+  const cleared = await adapter.clearThreadGoal(thread.thread_id);
+  assert.equal(cleared.cleared, true);
+  await assert.rejects(
+    adapter.setThreadGoal({ thread_id: thread.thread_id, objective: "x".repeat(4001) }),
+    /at most 4000 characters/,
+  );
   adapter.close();
 });
 

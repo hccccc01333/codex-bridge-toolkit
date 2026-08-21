@@ -75,6 +75,29 @@ test("run_until_stop reuses the next plan and stops on a later completed review"
   assert.equal(harness.state.round, 1);
 });
 
+test("continuous mode has no user round ceiling and stops on the web review", async () => {
+  const harness = createHarness({ reviews: [
+    { status: "continue", next_task: "task-2" },
+    { status: "continue", next_task: "task-3" },
+    { status: "completed", next_task: "" },
+  ] });
+  const result = await harness.runner.runUntilStop({ continuous: true, safety_limit: 5 });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.max_rounds, null);
+  assert.equal(result.rounds_run, 3);
+  assert.equal(harness.state.continuous, true);
+});
+
+test("continuous mode stops at its internal safety limit when no terminal review arrives", async () => {
+  const harness = createHarness({ reviews: [{ status: "continue", next_task: "again" }] });
+  const result = await harness.runner.runUntilStop({ continuous: true, safety_limit: 2 });
+
+  assert.equal(result.status, "continuous_safety_limit");
+  assert.equal(result.safety_limit, 2);
+  assert.equal(result.rounds_run, 2);
+});
+
 test("runtime runner refreshes state after a planner resets the brain state", async () => {
   let state = { goal: "", maxRounds: 2, round: 0, latestPlan: null, latestReview: null };
   const executed = [];

@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Codex ↔ Web LLM Bridge</title>
+  <style>
+    :root { color-scheme: dark; --bg:#111318; --panel:#1a1d24; --panel2:#20242d; --line:#303642; --text:#f2f4f7; --muted:#9ca5b3; --accent:#10a37f; --warn:#f0ad4e; --danger:#ef6b73; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; background:radial-gradient(circle at 15% 0%,#1d3a3a 0,#111318 42%); color:var(--text); font:14px/1.45 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+    button,select,input,textarea { font:inherit; }
+    button { border:1px solid var(--line); background:#252a34; color:var(--text); border-radius:9px; padding:9px 13px; cursor:pointer; transition:.15s ease; }
+    button:hover { border-color:#687385; transform:translateY(-1px); }
+    button.primary { background:var(--accent); border-color:var(--accent); color:#061b15; font-weight:700; }
+    button.danger { color:#ffd9dc; border-color:#734047; }
+    button:disabled { cursor:not-allowed; opacity:.45; transform:none; }
+    select,input,textarea { width:100%; border:1px solid var(--line); border-radius:8px; background:#12151b; color:var(--text); padding:9px 10px; outline:none; }
+    select:focus,input:focus,textarea:focus { border-color:var(--accent); box-shadow:0 0 0 2px #10a37f2b; }
+    textarea { min-height:82px; resize:vertical; }
+    .shell { width:min(1120px,calc(100% - 32px)); margin:0 auto; padding:28px 0 42px; }
+    header { display:flex; align-items:flex-start; justify-content:space-between; gap:20px; margin-bottom:22px; }
+    h1 { margin:0 0 6px; font-size:24px; letter-spacing:-.02em; }
+    .subtitle { color:var(--muted); } .subtitle b { color:var(--text); font-weight:600; }
+    .brand { display:flex; gap:12px; align-items:center; }
+    .logo { width:42px; height:42px; display:grid; place-items:center; border-radius:13px; background:linear-gradient(135deg,#10a37f,#6ee7b7); color:#06251c; font-weight:900; font-size:20px; }
+    .status { display:flex; align-items:center; gap:8px; border:1px solid var(--line); border-radius:999px; padding:8px 12px; color:var(--muted); white-space:nowrap; }
+    .dot { width:9px; height:9px; border-radius:50%; background:#737b89; } .dot.good { background:var(--accent); box-shadow:0 0 0 4px #10a37f22; } .dot.warn { background:var(--warn); } .dot.bad { background:var(--danger); }
+    .grid { display:grid; grid-template-columns:1.1fr .9fr; gap:16px; }
+    .card { background:color-mix(in srgb,var(--panel) 94%,transparent); border:1px solid var(--line); border-radius:14px; padding:18px; box-shadow:0 14px 45px #00000022; }
+    .card h2 { margin:0 0 15px; font-size:16px; }
+    .field { margin:12px 0; } .field label { display:block; color:var(--muted); font-size:12px; margin-bottom:6px; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .mode-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; }
+    .mode { position:relative; } .mode input { position:absolute; opacity:0; pointer-events:none; }
+    .mode label { display:block; border:1px solid var(--line); border-radius:9px; padding:10px 8px; cursor:pointer; text-align:center; color:var(--muted); }
+    .mode input:checked + label { border-color:var(--accent); color:var(--text); background:#10a37f18; }
+    .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:15px; }
+    .browser-list { display:grid; gap:9px; max-height:300px; overflow:auto; }
+    .browser-option { border:1px solid var(--line); background:#15181f; border-radius:10px; padding:11px; cursor:pointer; }
+    .browser-option.selected { border-color:var(--accent); background:#10a37f13; }
+    .browser-title { display:flex; justify-content:space-between; gap:10px; font-weight:700; }
+    .browser-meta,.tab-meta { color:var(--muted); font-size:12px; }
+    .tabs { display:grid; gap:6px; margin-top:9px; } .tab { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
+    .tab b { color:var(--text); font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .summary { display:grid; grid-template-columns:1fr 1fr; gap:9px; }
+    .kv { background:#15181f; border-radius:9px; padding:10px; min-height:55px; } .kv small { display:block; color:var(--muted); margin-bottom:3px; }
+    .kv strong { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .log { min-height:170px; max-height:290px; overflow:auto; background:#0d1015; border:1px solid #252a34; border-radius:9px; padding:12px; white-space:pre-wrap; word-break:break-word; color:#cbd3df; }
+    .empty { color:var(--muted); text-align:center; padding:28px 10px; }
+    .hint { color:var(--muted); font-size:12px; margin-top:7px; }
+    .hidden { display:none !important; }
+    /* The fallback panel is status-only. Control and message actions stay in Codex. */
+    body.status-only .grid { display:block; }
+    body.status-only .grid > .card:first-child { display:none; }
+    body.status-only .actions,
+    body.status-only .field { display:none !important; }
+    body.status-only .card { min-height:150px; }
+    @media (max-width:800px) { .grid { grid-template-columns:1fr; } header { flex-direction:column; } .mode-grid { grid-template-columns:1fr 1fr; } }
+  </style>
+</head>
+<body class="status-only">
+  <main class="shell">
+    <header>
+      <div class="brand"><div class="logo">↔</div><div><h1>Codex ↔ Web LLM Bridge</h1><div class="subtitle">Codex 对话：<b id="codexLabel">当前 Codex 对话</b> · 面板 <b id="panelId">—</b></div></div></div>
+      <div class="status"><i id="statusDot" class="dot"></i><span id="statusText">未连接</span></div>
+    </header>
+
+    <section class="grid">
+      <div class="card">
+        <h2>连接网页端</h2>
+        <div class="row">
+          <div class="field"><label for="provider">网页模型</label><select id="provider"><option value="chatgpt">ChatGPT Web</option><option value="deepseek">DeepSeek Web</option></select></div>
+          <div class="field"><label for="direction">起始方向</label><select id="direction"><option value="codex_to_web">Codex → 网页模型</option><option value="web_to_codex">网页模型 → Codex</option></select></div>
+        </div>
+        <div class="field"><label>浏览器实例</label><div id="browsers" class="browser-list"><div class="empty">点击“扫描浏览器”开始。</div></div></div>
+        <div class="row">
+          <div class="field"><label for="window">窗口</label><select id="window"><option value="">请先扫描</option></select></div>
+          <div class="field"><label for="tab">标签页</label><select id="tab"><option value="">请先扫描</option></select></div>
+        </div>
+        <div class="field"><label for="conversation">网页对话（可选）</label><input id="conversation" placeholder="可填写侧栏显示的对话标题或 URL" /></div>
+        <div class="field"><label>连接模式</label><div class="mode-grid">
+          <div class="mode"><input id="mode-one" name="mode" type="radio" value="one_shot" checked><label for="mode-one">单次</label></div>
+          <div class="mode"><input id="mode-manual" name="mode" type="radio" value="bounded"><label for="mode-manual">手动连接</label></div>
+          <div class="mode"><input id="mode-rounds" name="mode" type="radio" value="bounded"><label for="mode-rounds">指定轮次</label></div>
+          <div class="mode"><input id="mode-continuous" name="mode" type="radio" value="continuous"><label for="mode-continuous">持续目标</label></div>
+        </div></div>
+        <div id="roundsField" class="field hidden"><label for="rounds">往返轮数（1–50）</label><input id="rounds" type="number" min="1" max="50" value="10" /></div>
+        <div id="goalField" class="field hidden"><label for="goal">执行目标</label><textarea id="goal" placeholder="例如：修复当前项目所有 failing tests，并让网页模型审查通过。"></textarea></div>
+        <div class="actions"><button id="scan" class="primary">扫描浏览器</button><button id="connect">建立连接</button><button id="focus">定位标签页</button></div>
+        <div class="hint">面板只连接本机 127.0.0.1，不读取密码、Cookie 或 API Key。</div>
+      </div>
+
+      <div class="card">
+        <h2>当前连接状态</h2>
+        <div id="summary" class="summary"><div class="empty">尚未建立网页连接。</div></div>
+        <div class="actions"><button id="pause">暂停</button><button id="disconnect" class="danger">断开</button><button id="refresh">刷新状态</button></div>
+        <div class="field"><label for="message">发送给网页模型</label><textarea id="message" placeholder="输入一条明确、经过你确认的问题或任务"></textarea></div>
+        <div class="actions"><button id="send" class="primary">发送一次</button><button id="receive">读取新回复</button><button id="run">开始 Brain-Hand</button></div>
+        <div class="field"><label>事件</label><div id="log" class="log">面板已就绪。</div></div>
+      </div>
+    </section>
+  </main>
+  <script>
+    const token = new URLSearchParams(location.search).get("token") || "";
+    const panelContext = window.__BRIDGE_PANEL_CONTEXT__ || { label: "当前 Codex 对话", panel_id: "—" };
+    const state = { browsers: [], selectedBrowser: "", selectedWindow: "", selectedTab: "", link: null };
+    const $ = id => document.getElementById(id);
+    $("codexLabel").textContent = panelContext.label || "当前 Codex 对话";
+    $("panelId").textContent = panelContext.panel_id || "—";
+    const log = message => { const line = `[${new Date().toLocaleTimeString()}] ${message}`; $("log").textContent = `${line}\n${$("log").textContent}`.slice(0, 10000); };
+    const selectedMode = () => document.querySelector('input[name="mode"]:checked')?.id === "mode-manual" ? "bounded" : document.querySelector('input[name="mode"]:checked')?.value || "one_shot";
+    async function api(path, options = {}) { const response = await fetch(path, { ...options, headers: { "content-type": "application/json", "x-bridge-panel-token": token, ...(options.headers || {}) } }); const data = await response.json().catch(() => ({})); if (!response.ok && !data.structuredContent) throw new Error(data.error || data.text || `请求失败：${response.status}`); return data; }
+    function browser() { return state.browsers.find(item => item.browser_instance === state.selectedBrowser) || null; }
+    function windowChoice() { return browser()?.windows?.find(item => item.window === state.selectedWindow) || null; }
+    function renderBrowsers() {
+      const root = $("browsers");
+      if (!state.browsers.length) { root.innerHTML = '<div class="empty">没有发现浏览器。请先启动允许网页调试的 Edge，或使用专用浏览器。</div>'; return; }
+      root.innerHTML = state.browsers.map(item => `<div class="browser-option ${item.browser_instance === state.selectedBrowser ? "selected" : ""}" data-browser="${escapeHtml(item.browser_instance)}"><div class="browser-title"><span>${escapeHtml(item.browser_instance)}</span><span>${item.debugging ? "● 可连接" : "○ 需开启连接"}</span></div><div class="browser-meta">${item.debugging ? `${item.window_count} 个窗口 · ${item.tab_count} 个标签页` : escapeHtml(item.unavailable_reason || "尚未允许网页连接")}</div></div>`).join("");
+      root.querySelectorAll("[data-browser]").forEach(node => node.onclick = () => { state.selectedBrowser = node.dataset.browser; state.selectedWindow = ""; state.selectedTab = ""; renderBrowsers(); renderWindowAndTabs(); });
+    }
+    function renderWindowAndTabs() {
+      const b = browser(); const windows = b?.windows || []; if (!windows.some(item => item.window === state.selectedWindow)) state.selectedWindow = windows.length === 1 ? windows[0].window : "";
+      $("window").innerHTML = windows.length ? '<option value="">选择窗口</option>' + windows.map(item => `<option value="${escapeHtml(item.window)}">${escapeHtml(item.window)} · ${item.tab_count} 个标签页</option>`).join("") : '<option value="">请先扫描</option>';
+      $("window").value = state.selectedWindow;
+      const tabs = (windowChoice()?.tabs || []).filter(item => item.url && (($("provider").value === "deepseek" && item.url.includes("chat.deepseek.com")) || ($("provider").value === "chatgpt" && (item.url.includes("chatgpt.com") || item.url.includes("chat.openai.com")))));
+      if (!tabs.some(item => String(item.tab_index) === String(state.selectedTab))) state.selectedTab = tabs.length === 1 ? String(tabs[0].tab_index) : "";
+      $("tab").innerHTML = tabs.length ? '<option value="">选择标签页</option>' + tabs.map(item => `<option value="${item.tab_index}">${item.tab_index} · ${escapeHtml(item.title)}</option>`).join("") : '<option value="">没有匹配的网页端标签页</option>';
+      $("tab").value = state.selectedTab;
+    }
+    function escapeHtml(value) { return String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;","\"":"&quot;"}[char])); }
+    function renderSummary(link) {
+      state.link = link || null; const connected = ["ready","connected","running","awaiting_goal"].includes(link?.state); $("statusText").textContent = link?.state || "未连接"; $("statusDot").className = `dot ${connected ? (link?.state === "awaiting_goal" ? "warn" : "good") : link?.state === "waiting_for_login" ? "warn" : link?.state === "paused" ? "bad" : ""}`;
+      if (!link || link.state === "idle") { $("summary").innerHTML = '<div class="empty">尚未建立网页连接。</div>'; return; }
+      const fields = [["网页模型",link.provider],["浏览器",link.browser],["窗口",link.window],["标签页",link.tab?.title],["对话",link.conversation?.title || "当前对话未确认"],["模式",link.mode],["状态",link.state]];
+      $("summary").innerHTML = fields.map(([key,value]) => `<div class="kv"><small>${key}</small><strong title="${escapeHtml(value || "")}">${escapeHtml(value || "—")}</strong></div>`).join("");
+    }
+    async function scan() { try { const data = await api("/api/discover?token=" + encodeURIComponent(token)); state.browsers = data.structuredContent?.browsers || []; state.selectedBrowser = state.browsers.find(item => item.debugging)?.browser_instance || state.browsers[0]?.browser_instance || ""; state.selectedWindow = ""; state.selectedTab = ""; renderBrowsers(); renderWindowAndTabs(); log(data.text || "扫描完成"); } catch (error) { log(error); } }
+    async function refresh() { try { const data = await api("/api/status?token=" + encodeURIComponent(token)); renderSummary(data.structuredContent || {}); if (data.text) log(data.text); } catch (error) { log(error); } }
+    async function connect() { /* Status-only panel: connect from the Codex conversation. */ }
+    async function action(path, body = {}) { try { const data = await api(path, { method:"POST", body:JSON.stringify(body) }); renderSummary(data.structuredContent || state.link || {}); log(data.text || "操作完成"); return data; } catch (error) { log(error); } }
+    $("refresh").onclick = refresh;
+    setInterval(refresh, 2500);
+    refresh();
+  </script>
+</body>
+</html>
