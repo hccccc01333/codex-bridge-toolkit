@@ -65,3 +65,30 @@ test("relay engine does not start another round after an explicit pause", async 
   assert.equal(result.status, "paused");
   assert.equal(result.last_stop, "user pause");
 });
+
+test("failed web delivery pauses the relay, blocks waiting reads, and remains retryable after resume", async () => {
+  let fail = true;
+  const engine = createRelayEngine({
+    config: { mode: "one_shot" },
+    sendMessage: async envelope => {
+      if (fail) throw new Error("send button unavailable");
+      return envelope.content;
+    },
+    receiveMessage: async () => ({ content: "must not be read after send failure" }),
+  });
+
+  await assert.rejects(engine.send({ content: "retry me", provider: "chatgpt" }), /send button unavailable/);
+  assert.equal(engine.status().state, "paused");
+  const blockedReceive = await engine.receive({ provider: "chatgpt" });
+  assert.equal(blockedReceive.received, false);
+  assert.equal(blockedReceive.state, "paused");
+  const blockedRun = await engine.run({ goal: "must not start" });
+  assert.equal(blockedRun.started, false);
+
+  fail = false;
+  const resumed = await engine.resume();
+  assert.equal(resumed.resumed, true);
+  const retried = await engine.send({ content: "retry me", provider: "chatgpt" });
+  assert.equal(retried.sent, true);
+  assert.equal(engine.status().state, "completed");
+});

@@ -34,6 +34,14 @@ test("web sends use a same-tab delivery guard and do not return an unstable prev
   assert.doesNotMatch(serverSource, /last: previous/);
 });
 
+test("web send failures pause the relay and block automatic waiting reads", () => {
+  assert.match(serverSource, /async function pauseActiveBridge\(/);
+  assert.match(serverSource, /await pauseActiveBridge\(String\(error\), code\)/);
+  assert.match(serverSource, /if \(activeBridgeLink\.state === "paused" \|\| relayState === "paused"\)/);
+  assert.match(serverSource, /requires_resume: true/);
+  assert.match(serverSource, /activeRelayEngine\.resume/);
+});
+
 test("Codex binding consumes host context when available and fails closed on mismatch", () => {
   assert.match(serverSource, /function hostCodexContextFromRequest\(/);
   assert.match(serverSource, /__host_codex_context/);

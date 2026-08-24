@@ -239,6 +239,7 @@ opencode serve --hostname 127.0.0.1 --port 4096
 | Web Session Swarm | `bridge_swarm_create`、`bridge_swarm_status`、`bridge_swarm_run` |
 | Brain-Hand loop | `brain_plan`、`executor_report`、`brain_review`、`continue_task` |
 | OpenCode executor | `executor_provider_list`、`codex_adapter_status`、`codex_thread_start` |
+| Codex source read | `codex_source_thread_read`（只读读取明确提供的 `codex://threads/<id>`，不会绑定、执行或自动转发） |
 
 普通用户不需要记工具名；直接在当前宿主对话里描述意图即可，例如：
 
@@ -291,9 +292,21 @@ tests/                       协议、路由、适配器和压力测试
 
 桥接只会在原标签页刷新一次并重新检查。成功就继续；失败则保留原目标并暂停。不会因为一次 UI 失效而重复创建标签页或重发消息。
 
+如果网页消息发送失败，连接会进入“已暂停”，不会继续等待或读取网页回复。修复原标签页后说“登录好了，继续”或明确要求恢复；插件才会重新检查并允许重试。
+
 ### 连接发错网页对话
 
 立即说“暂停网页连接”。修正原标签页中的网页对话后，再明确要求恢复。连接不会自动猜测新标题。
+
+ChatGPT 自定义 GPT 的会话地址（`/g/.../c/...`）也会按其中的会话 ID 校验；如果地址或会话发生变化，桥接会暂停，不会自动切换。
+
+### 搬运另一个 Codex 对话
+
+如果需要参考或搬运另一个 Codex 任务，请明确提供它的 `codex://threads/<id>` 地址。插件只读提取有界内容；它不会把另一个任务误当成当前 Codex Worker，也不会同步它的 Goal 或自动执行。需要转发给网页端时，必须由用户明确提出。
+
+### Windows 下 Codex Worker 启动失败
+
+插件默认通过 PATH 中的 `codex.cmd` 启动 App Server，而不是桌面版 `codex.exe`。如果 Codex CLI 不在 PATH，可设置 `CODEX_BRIDGE_CODEX_COMMAND` 指向可执行的 `codex.cmd` 或 `codex.ps1`，然后重启宿主。
 
 ### OpenCode 看不到 MCP
 

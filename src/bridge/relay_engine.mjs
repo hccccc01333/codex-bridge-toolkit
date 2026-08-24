@@ -70,7 +70,7 @@ export function createRelayEngine({
   }
 
   async function send({ content, provider, conversationId, conversationTitle, sourceMessageId = "", turnIndex = state.round } = {}) {
-    if (state.state === "paused" || state.state === "completed" || state.state === "blocked") {
+    if (["paused", "completed", "blocked", "disconnected"].includes(state.state)) {
       return { sent: false, state: state.state, reason: state.last_stop || "relay is not active" };
     }
     if (!(await verify())) return { sent: false, state: state.state, reason: state.last_stop };
@@ -85,13 +85,24 @@ export function createRelayEngine({
       content,
     });
     if (wasMessageConsumed(envelope, consumed)) return failClosed("duplicate outgoing message", "duplicate_loop");
+    let result;
+    try {
+      result = await sendMessage(envelope);
+    } catch (error) {
+      await failClosed(String(error), error.code || "send_failed");
+      throw error;
+    }
+    // A failed delivery must remain retryable after an explicit resume. Do not
+    // consume the envelope until the host adapter confirms the send completed.
     markMessageConsumed(envelope, consumed);
-    const result = await sendMessage(envelope);
     if (state.mode === "one_shot") await transition("completed", "one-shot message delivered");
     return { sent: true, envelope, result, state: { ...state } };
   }
 
   async function receive({ provider, conversationId, conversationTitle, sourceMessageId = "", turnIndex = state.round } = {}) {
+    if (["paused", "completed", "blocked", "disconnected"].includes(state.state)) {
+      return { received: false, state: state.state, reason: state.last_stop || "relay is not active" };
+    }
     if (!(await verify())) return { received: false, state: state.state, reason: state.last_stop };
     const result = await receiveMessage();
     if (!result?.content) return { received: false, new_message: false, state: { ...state } };
@@ -111,6 +122,14 @@ export function createRelayEngine({
   }
 
   async function run({ context = "", constraints = [], ...input } = {}) {
+    if (["paused", "completed", "blocked", "disconnected"].includes(state.state)) {
+      return {
+        started: false,
+        status: state.state,
+        state: { ...state },
+        reason: state.last_stop || "relay is not active; resume the link explicitly first",
+      };
+    }
     if (state.mode === "one_shot" || state.rounds === 0) {
       return { started: false, state: { ...state }, reason: "relay is connected for manual or one-shot use" };
     }
@@ -152,6 +171,15 @@ export function createRelayEngine({
     return transition("disconnected", reason);
   }
 
+  async function resume(reason = "user resume") {
+    if (state.state !== "paused") {
+      return { resumed: false, state: { ...state }, reason: "only a paused relay can be resumed" };
+    }
+    const nextState = state.mode === "bounded" && state.rounds === 0 ? "ready" : "connected";
+    await transition(nextState, reason);
+    return { resumed: true, state: { ...state } };
+  }
+
   function status() {
     return { ...state, supported_states: [...CONNECTION_STATES] };
   }
@@ -161,5 +189,5 @@ export function createRelayEngine({
     return { ...state };
   }
 
-  return { send, receive, run, pause, stop, status, setGoal };
+  return { send, receive, run, pause, stop, resume, status, setGoal };
 }

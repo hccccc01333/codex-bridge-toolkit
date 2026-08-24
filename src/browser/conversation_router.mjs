@@ -10,6 +10,10 @@ export function conversationIdFromUrl(rawUrl, provider = "chatgpt") {
         if (/^[A-Za-z0-9_-]+$/.test(remainder)) return remainder;
       }
     }
+    for (const pattern of profile.conversation_path_patterns || []) {
+      const match = new RegExp(pattern, "i").exec(url.pathname);
+      if (match?.[1] && /^[A-Za-z0-9_-]+$/.test(match[1])) return match[1];
+    }
     return null;
   } catch {
     return null;
@@ -24,7 +28,6 @@ export function safeConversationUrl(rawUrlOrId, provider = "chatgpt") {
   let url;
   try { url = new URL(value); } catch { return null; }
   if (!profile.hosts.includes(url.hostname.toLowerCase())) return null;
-  if (!profile.conversation_prefixes.some(prefix => url.pathname.toLowerCase().startsWith(prefix.toLowerCase()))) return null;
   if (!conversationIdFromUrl(url.href, profile.id)) return null;
   return `${url.origin}${url.pathname}`;
 }

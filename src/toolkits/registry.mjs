@@ -11,7 +11,7 @@ const TOOLKITS = Object.freeze([
     display_name: "Executor Host Adapters",
     status: "experimental",
     description: "为同一种网页大脑桥接提供并列的本地执行宿主：Codex App Server 与 OpenCode serve HTTP API。OpenCode 也可以反过来把本插件作为本地 stdio MCP server 使用。",
-    tools: ["executor_provider_list", "codex_adapter_status", "codex_thread_start", "codex_thread_turn", "codex_thread_read", "bridge_host_status"],
+    tools: ["executor_provider_list", "codex_adapter_status", "codex_thread_start", "codex_thread_turn", "codex_thread_read", "codex_source_thread_read", "bridge_host_status"],
   },
   {
     id: "browser-watchdog",

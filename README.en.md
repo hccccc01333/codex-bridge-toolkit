@@ -237,6 +237,7 @@ Hosts with MCP UI resources can render it in the current conversation. Other hos
 | Web Session Swarm | `bridge_swarm_create`, `bridge_swarm_status`, `bridge_swarm_run` |
 | Brain-Hand loop | `brain_plan`, `executor_report`, `brain_review`, `continue_task` |
 | OpenCode executor | `executor_provider_list`, `codex_adapter_status`, `codex_thread_start` |
+| Codex source read | `codex_source_thread_read` (bounded read-only access to an explicit `codex://threads/<id>`; never binds, executes, or forwards automatically) |
 
 Most users only need natural-language requests in the current host conversation:
 
@@ -289,9 +290,21 @@ A normally launched Edge cannot be attached after the fact. Let the bridge start
 
 The bridge refreshes the original tab once and checks again. If recovery fails, it keeps the original target and pauses. It does not create another tab or resend the prompt.
 
+If web delivery fails, the link enters `PAUSED`; it does not continue waiting for or reading a web reply. Repair the original tab, then explicitly resume so the bridge can re-check the destination and retry safely.
+
 ### The message would go to the wrong web conversation
 
 Say “Pause the web link,” repair the original tab's visible conversation, and explicitly resume. The bridge does not guess a new title.
+
+ChatGPT custom GPT URLs (`/g/.../c/...`) are also checked by their conversation ID. If the URL or conversation changes, the link pauses instead of switching automatically.
+
+### Bringing in another Codex conversation
+
+When you explicitly provide a `codex://threads/<id>` URL for reference or transfer, the bridge reads bounded content only. It does not treat that other task as the current Codex Worker, synchronize its Goal, or execute it. Forwarding it to a web model still requires an explicit user request.
+
+### Codex Worker fails to start on Windows
+
+The bridge starts App Server through `codex.cmd` on PATH rather than the Desktop `codex.exe`. If the Codex CLI is not on PATH, set `CODEX_BRIDGE_CODEX_COMMAND` to a working `codex.cmd` or `codex.ps1`, then restart the host.
 
 ### OpenCode cannot see the MCP server
 

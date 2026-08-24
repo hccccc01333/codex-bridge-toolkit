@@ -20,6 +20,7 @@ const CHATGPT = Object.freeze({
     'a[href*="/c/"]',
   ]),
   conversation_prefixes: Object.freeze(["/c/"]),
+  conversation_path_patterns: Object.freeze(["/c/([A-Za-z0-9_-]+)(?:/|$)"]),
   default_conversation_prefix: "/c/",
   login_terms: Object.freeze(["log in", "sign up", "登录", "注册"]),
   generating_terms: Object.freeze(["stop", "generating", "停止", "生成中"]),
@@ -53,6 +54,10 @@ const DEEPSEEK = Object.freeze({
     'a[href*="/chat/"]',
   ]),
   conversation_prefixes: Object.freeze(["/a/chat/s/", "/chat/"]),
+  conversation_path_patterns: Object.freeze([
+    "/a/chat/s/([A-Za-z0-9_-]+)(?:/|$)",
+    "/chat/([A-Za-z0-9_-]+)(?:/|$)",
+  ]),
   default_conversation_prefix: "/a/chat/s/",
   login_terms: Object.freeze(["log in", "sign up", "登录", "注册", "login"]),
   generating_terms: Object.freeze(["stop", "generating", "停止", "生成中", "停止生成"]),
@@ -90,6 +95,7 @@ export function listBrainProviders() {
     start_url: provider.start_url,
     hosts: [...provider.hosts],
     conversation_prefixes: [...provider.conversation_prefixes],
+    conversation_path_patterns: [...(provider.conversation_path_patterns || [])],
   }));
 }
 

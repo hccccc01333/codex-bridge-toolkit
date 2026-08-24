@@ -2,7 +2,30 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { CodexAdapter } from "../src/adapters/codex.mjs";
+import { CodexAdapter, codexSpawnSpec, codexThreadIdFromUrl, defaultCodexCommand } from "../src/adapters/codex.mjs";
+
+test("Codex Adapter resolves the Windows CLI launcher without spawning the desktop executable", () => {
+  assert.equal(defaultCodexCommand({ platform: "win32", env: {} }), "codex.cmd");
+  assert.equal(defaultCodexCommand({ platform: "linux", env: {} }), "codex");
+  assert.equal(defaultCodexCommand({ platform: "win32", env: { CODEX_BRIDGE_CODEX_COMMAND: "D:\\tools\\codex.cmd" } }), "D:\\tools\\codex.cmd");
+  assert.deepEqual(codexSpawnSpec("C:\\Program Files\\codex.cmd", ["app-server"], { platform: "win32", env: { ComSpec: "cmd.exe" } }), {
+    command: "cmd.exe",
+    args: ["/d", "/s", "/c", '"C:\\Program Files\\codex.cmd" app-server'],
+    options: {},
+  });
+  assert.deepEqual(codexSpawnSpec("codex.ps1", ["app-server"], { platform: "win32" }), {
+    command: "powershell.exe",
+    args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "codex.ps1", "app-server"],
+    options: {},
+  });
+});
+
+test("Codex source thread URLs are parsed explicitly and reject ordinary URLs", () => {
+  const id = "01a0331b-f45f-7bd0-861f-e2e491e43328";
+  assert.equal(codexThreadIdFromUrl(`codex://threads/${id}`), id);
+  assert.equal(codexThreadIdFromUrl(`codex://threads/${id}/extra`), null);
+  assert.equal(codexThreadIdFromUrl(`https://chatgpt.com/c/${id}`), null);
+});
 
 class FakeCodexProcess extends EventEmitter {
   constructor() {

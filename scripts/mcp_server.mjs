@@ -63,7 +63,7 @@ import {
   normalizeCodexProfile,
   normalizeExecutorProvider,
 } from "../src/adapters/executor.mjs";
-import { createCodexAdapter } from "../src/adapters/codex.mjs";
+import { createCodexAdapter, codexThreadIdFromUrl } from "../src/adapters/codex.mjs";
 import { createOpenCodeAdapter } from "../src/adapters/opencode.mjs";
 import { getWebLLMAdapter } from "../src/adapters/provider_registry.mjs";
 import { createRuntimeRunner } from "../src/runtime/runner.mjs";
@@ -244,6 +244,14 @@ function codexBindingView(route = activeRoute) {
       source: "current_codex_conversation",
       label: binding.title || "当前 Codex 对话",
       verified: Boolean(binding.verified),
+    };
+  }
+  if (binding?.source === "external_codex_thread") {
+    return {
+      state: "external_thread",
+      source: "external_codex_thread",
+      label: "指定的其他 Codex 对话（未绑定为当前 Worker）",
+      verified: false,
     };
   }
   if (route?.codex_thread_id) {
@@ -1010,6 +1018,24 @@ function routeCreate(args = {}) {
   try { executorAgent = executorProvider === "opencode" ? normalizeExecutorAgent(args.executor_agent ?? args.executorAgent ?? "") : ""; }
   catch (error) { return jsonResult(String(error), { created: false }, true); }
   const hostContext = hostCodexContextOf(args);
+  const explicitCodexThreadId = String(args.codex_thread_id ?? args.codexThreadId ?? "").trim() || null;
+  const codexBinding = hostContext?.thread_id && explicitCodexThreadId && explicitCodexThreadId !== hostContext.thread_id
+    ? {
+      state: "external_thread",
+      source: "external_codex_thread",
+      thread_id: explicitCodexThreadId,
+      title: null,
+      verified: false,
+      bound_at: new Date().toISOString(),
+    }
+    : hostContext?.thread_id ? {
+      state: "bound",
+      source: "current_codex_conversation",
+      thread_id: hostContext.thread_id,
+      title: hostContext.title || null,
+      verified: true,
+      bound_at: new Date().toISOString(),
+    } : null;
   const route = newRouteRecord(id, {
     name: args.name,
     brain_provider: brainProvider,
@@ -1018,15 +1044,8 @@ function routeCreate(args = {}) {
     executor_profile: executorProfile || null,
     executor_endpoint: executorEndpoint || null,
     executor_agent: executorAgent || null,
-    codex_thread_id: args.codex_thread_id ?? args.codexThreadId ?? hostContext?.thread_id,
-    codex_binding: hostContext?.thread_id ? {
-      state: "bound",
-      source: "current_codex_conversation",
-      thread_id: hostContext.thread_id,
-      title: hostContext.title || null,
-      verified: true,
-      bound_at: new Date().toISOString(),
-    } : null,
+    codex_thread_id: explicitCodexThreadId || hostContext?.thread_id,
+    codex_binding: codexBinding,
     session_id: sessionId,
     target_id: session.target_id,
     conversation_id: session.conversation?.id,
@@ -1216,7 +1235,12 @@ async function codexThreadStart(args = {}) {
   try {
     const hostContext = hostCodexContextOf(args);
     const explicitlyRequestedThread = args.codex_thread_id || args.codexThreadId || null;
-    if (hostContext?.thread_id && route.codex_binding?.thread_id && route.codex_binding.thread_id !== hostContext.thread_id) {
+    if (route.codex_binding?.source === "external_codex_thread" && !explicitlyRequestedThread) {
+      const error = new Error("该路由包含另一个 Codex 对话；必须通过显式 Codex Adapter 调用，不能把它当作当前 Codex Worker 执行");
+      error.code = "CODEX_EXTERNAL_THREAD_REQUIRES_EXPLICIT_ADAPTER";
+      throw error;
+    }
+    if (hostContext?.thread_id && route.codex_binding?.thread_id && route.codex_binding.thread_id !== hostContext.thread_id && route.codex_binding?.source !== "external_codex_thread") {
       const error = new Error("当前 Codex 对话与该路由已绑定的 Worker 不一致；未切换执行线程");
       error.code = "CODEX_THREAD_BINDING_MISMATCH";
       throw error;
@@ -1299,6 +1323,19 @@ async function syncCodexNativeGoal({ routeId = activeRouteId, objective, status 
     if (activeRouteId === id) activeRoute = updated;
     return pending;
   }
+  if (route.codex_binding?.source === "external_codex_thread") {
+    const pending = {
+      synced: false,
+      state: "blocked",
+      code: "CODEX_EXTERNAL_THREAD_NOT_BOUND",
+      reason: "native Codex Goal is not synchronized to an explicitly supplied external thread",
+      thread_id: route.codex_thread_id,
+    };
+    const updated = updateRoute(id, { native_goal: pending, status: "paused", last_action: "codex_thread_goal_blocked" });
+    appendRouteEvent(id, { type: "CODEX_GOAL_SYNC_BLOCKED", summary: "native Goal blocked for an external Codex thread" });
+    if (activeRouteId === id) activeRoute = updated;
+    return { ...pending, route: routeSummary(updated) };
+  }
   try {
     const provider = getExecutorProvider(route.executor_provider || DEFAULT_EXECUTOR_PROVIDER);
     const model = executorModelOf(provider, route.executor_model || "");
@@ -1356,6 +1393,13 @@ async function syncCodexNativeGoal({ routeId = activeRouteId, objective, status 
 
 async function codexThreadTurn(args = {}) {
   let route = activateRoute(args);
+  if (route.codex_binding?.source === "external_codex_thread" && !String(args.codex_thread_id || args.codexThreadId || "").trim()) {
+    return jsonResult("该路由绑定的是其他 Codex 对话；未执行隐式跨会话发送，请显式提供 codex_thread_id", {
+      sent: false,
+      route_id: route.route_id,
+      code: "CODEX_EXTERNAL_THREAD_REQUIRES_EXPLICIT_ADAPTER",
+    }, true);
+  }
   const threadId = args.codex_thread_id || route.codex_thread_id;
   if (!threadId) return jsonResult("codex_thread_id is required; call codex_thread_start first", { sent: false }, true);
   try {
@@ -1419,6 +1463,59 @@ async function codexThreadRead(args = {}) {
     return jsonResult(`Codex/OpenCode session read: ${threadId}`, { read: true, thread_id: threadId, executor_provider: provider.id, executor_model: model, executor_profile: profile || null, executor_endpoint: endpoint || null, executor_agent: agent || null, result });
   } catch (error) {
     return jsonResult(String(error), { read: false, route_id: route.route_id, code: error.code || "CODEX_ADAPTER_ERROR" }, true);
+  }
+}
+
+function collectCodexSourceText(value, chunks = [], seen = new Set(), depth = 0) {
+  if (value === null || value === undefined || depth > 10 || chunks.join("\n").length >= 24000) return chunks;
+  if (typeof value === "string") {
+    if (value.trim()) chunks.push(value.trim());
+    return chunks;
+  }
+  if (typeof value !== "object" || seen.has(value)) return chunks;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) collectCodexSourceText(item, chunks, seen, depth + 1);
+    return chunks;
+  }
+  for (const key of ["title", "summary", "message", "text", "content", "body", "output"]) {
+    if (key in value) collectCodexSourceText(value[key], chunks, seen, depth + 1);
+  }
+  return chunks;
+}
+
+async function codexSourceThreadRead(args = {}) {
+  const threadUrl = String(args.thread_url || args.threadUrl || "").trim();
+  const threadId = codexThreadIdFromUrl(threadUrl);
+  if (!threadId) {
+    return jsonResult("thread_url must be an explicit codex://threads/<thread-id> URL", { read: false, code: "CODEX_SOURCE_URL_INVALID" }, true);
+  }
+  const route = activateRoute(args);
+  let adapter;
+  try {
+    const provider = getExecutorProvider("chatgpt_luna");
+    const model = executorModelOf(provider, provider.default_model);
+    const profile = codexProfileOf(provider, "", model);
+    adapter = createCodexAdapter({
+      cwd: route.workspace?.root || process.cwd(),
+      args: codexLaunchArgs(provider, model, profile),
+    });
+    const result = await adapter.readThread(threadId);
+    const maxChars = Math.min(24000, Math.max(1000, Number(args.max_chars) || 12000));
+    const sourceText = clip(collectCodexSourceText(result).join("\n\n"), maxChars);
+    return jsonResult(`已只读读取指定 Codex 对话：${threadId}`, {
+      read: true,
+      source: "explicit_codex_thread",
+      thread_url: threadUrl,
+      thread_id: threadId,
+      text: sourceText,
+      truncated: sourceText.endsWith("...[truncated]"),
+      note: "这是其他 Codex 对话的只读内容；不会把它绑定为当前 Codex Worker，也不会自动执行或转发。",
+    });
+  } catch (error) {
+    return jsonResult(String(error), { read: false, thread_url: threadUrl, code: error.code || "CODEX_SOURCE_READ_FAILED" }, true);
+  } finally {
+    adapter?.close?.();
   }
 }
 
@@ -1916,14 +2013,20 @@ async function currentConversationData(provider = brainProviderOf()) {
   const adapter = getWebLLMAdapter(provider.id);
   const profile = adapter.profile;
   const linkSelectors = JSON.stringify(profile.conversation_link_selectors);
+  const conversationPrefixes = JSON.stringify(profile.conversation_prefixes || []);
+  const conversationPathPatterns = JSON.stringify(profile.conversation_path_patterns || []);
   const state = await evaluate(`(() => {
     const url = location.href;
     const selectors = ${linkSelectors};
+    const prefixes = ${conversationPrefixes};
+    const pathPatterns = ${conversationPathPatterns};
     const links = selectors.flatMap(selector => [...document.querySelectorAll(selector)]);
     const current = links.find(anchor => anchor.href.split('?')[0] === url.split('?')[0]);
     const rawTitle = (current?.getAttribute('aria-label') || current?.innerText || document.title || '').trim();
     const title = rawTitle.replace('，已置顶对话', '').replace('（未读）', '').trim();
-    return { title, url, is_conversation: Boolean(${JSON.stringify(profile.conversation_prefixes)}.some(prefix => location.pathname.toLowerCase().startsWith(prefix.toLowerCase()))) };
+    const isConversation = prefixes.some(prefix => location.pathname.toLowerCase().startsWith(prefix.toLowerCase()))
+      || pathPatterns.some(pattern => new RegExp(pattern, 'i').test(location.pathname));
+    return { title, url, is_conversation: isConversation };
   })()`);
   return { ...state, id: conversationIdFromUrl(state?.url || "", provider.id) };
 }
@@ -2444,6 +2547,7 @@ function publicBridgeLink(extra = {}) {
       finished_at: activeBridgeRun.finished_at || null,
       error: activeBridgeRun.error || null,
     } : null,
+    failure: activeBridgeLink.failure || null,
     requires_goal: !Boolean(activeBridgeLink.goal || activeBridgeLink.config?.goal || brainState.goal)
       && ["awaiting_goal", "connected", "ready"].includes(activeBridgeLink.state),
     ...extra,
@@ -2522,7 +2626,20 @@ async function bridgeConnect(args = {}) {
     });
     const healthy = Boolean(health.structuredContent?.healthy);
     const hasGoal = Boolean(activeBridgeLink.goal || activeBridgeLink.config?.goal || brainState.goal);
-    activeBridgeLink.state = healthy ? (hasGoal ? "connected" : "awaiting_goal") : "waiting_for_login";
+    if (healthy && activeRelayEngine?.status?.().state === "paused") {
+      const resumed = await activeRelayEngine.resume?.("用户确认已修复网页连接");
+      if (!resumed?.resumed) {
+        return jsonResult("网页连接仍处于暂停状态，请先断开并重新连接", publicBridgeLink({
+          state: "paused",
+          requires_resume: true,
+        }), true);
+      }
+      activeBridgeLink.failure = null;
+    }
+    const relayState = activeRelayEngine?.status?.().state;
+    activeBridgeLink.state = healthy
+      ? (relayState === "completed" ? "completed" : hasGoal ? "connected" : "awaiting_goal")
+      : "waiting_for_login";
     return jsonResult(
       healthy
         ? (hasGoal ? "网页端已准备好，可以继续" : "网页端已连接。请告诉我你希望 Codex 完成什么，我会把你的回答创建为本次桥接目标")
@@ -2743,6 +2860,24 @@ async function bridgeConnect(args = {}) {
 
 function bridgeStatus() {
   return jsonResult("网页端连接状态", publicBridgeLink());
+}
+
+async function pauseActiveBridge(reason, code = "BRIDGE_FAILURE") {
+  if (!activeBridgeLink) return;
+  await activeRelayEngine?.pause?.(reason);
+  activeBridgeLink.state = "paused";
+  activeBridgeLink.failure = {
+    code,
+    reason: String(reason || "网页桥接失败"),
+    at: new Date().toISOString(),
+  };
+  persistActiveSession();
+  syncActiveRoute({ status: "paused", last_action: "bridge_paused" });
+  appendRouteEvent(activeBridgeLink.route_id, {
+    type: "BRIDGE_PAUSED",
+    summary: activeBridgeLink.failure.reason,
+    data: { code },
+  });
 }
 
 // Internal-only runtime facts used by the parent Swarm coordinator. This name
@@ -3309,7 +3444,13 @@ async function bridgeSend(args = {}) {
       turnIndex: activeBridgeLink.round || 0,
     });
     if (!result.sent) {
-      return jsonResult(result.reason || "网页端消息未发送", publicBridgeLink({ sent: false, reason: result.reason || "连接未处于可发送状态" }), true);
+      const reason = result.reason || "连接未处于可发送状态";
+      const paused = result.state === "paused" || activeRelayEngine?.status?.().state === "paused";
+      return jsonResult(
+        paused ? `网页端消息未发送，连接已暂停：${reason}` : reason,
+        publicBridgeLink({ sent: false, reason, state: paused ? "paused" : activeBridgeLink.state, requires_resume: paused }),
+        true,
+      );
     }
     const reply = result.result?.reply || "";
     const envelope = createMessageEnvelope({
@@ -3323,10 +3464,14 @@ async function bridgeSend(args = {}) {
     });
     return jsonResult(reply, publicBridgeLink({ sent: true, reply, message: envelope, state: activeBridgeLink.state }));
   } catch (error) {
-    activeBridgeLink.state = "paused";
-    return jsonResult(String(error), publicBridgeLink({
+    const code = error.code || "BRIDGE_SEND_FAILED";
+    await pauseActiveBridge(String(error), code);
+    return jsonResult(`网页端发送失败，连接已暂停：${String(error)}`, publicBridgeLink({
       sent: false,
-      reason: "目标不一致，未发送任何内容",
+      state: "paused",
+      reason: String(error),
+      requires_resume: true,
+      failure: activeBridgeLink.failure,
       expected_conversation: error.expected || activeBridgeLink.conversation,
       actual_conversation: error.actual || null,
     }), true);
@@ -3338,6 +3483,16 @@ async function bridgeReceive() {
   if (!activeBridgeLink.goal && !activeBridgeLink.config?.goal && !brainState.goal) {
     return jsonResult("连接已建立，请先回答“你希望 Codex 完成什么？”，再读取网页消息", publicBridgeLink({ received: false, requires_goal: true }), true);
   }
+  const relayState = activeRelayEngine?.status?.().state;
+  if (activeBridgeLink.state === "paused" || relayState === "paused") {
+    const reason = activeBridgeLink.failure?.reason || activeRelayEngine?.status?.().last_stop || "网页桥接已暂停";
+    return jsonResult(`网页桥接已暂停，未读取网页消息：${reason}`, publicBridgeLink({
+      received: false,
+      state: "paused",
+      reason,
+      requires_resume: true,
+    }), true);
+  }
   try {
     const result = await activeRelayEngine.receive({
       provider: activeBridgeLink.provider_id,
@@ -3346,16 +3501,42 @@ async function bridgeReceive() {
       sourceMessageId: selectedConversation?.url,
       turnIndex: activeBridgeLink.round || 0,
     });
-    if (!result.received) return jsonResult("网页端暂无新消息", publicBridgeLink({ received: false, new_message: false }));
+    if (!result.received) {
+      if (result.state === "paused") {
+        return jsonResult(`网页桥接已暂停，未读取网页消息：${result.reason || "relay is paused"}`, publicBridgeLink({
+          received: false,
+          state: "paused",
+          reason: result.reason || "relay is paused",
+          requires_resume: true,
+        }), true);
+      }
+      return jsonResult("网页端暂无新消息", publicBridgeLink({ received: false, new_message: false }));
+    }
     return jsonResult(result.envelope.content, publicBridgeLink({ received: true, new_message: true, message: result.envelope }));
   } catch (error) {
-    activeBridgeLink.state = "paused";
-    return jsonResult(String(error), publicBridgeLink({ received: false, reason: "目标不一致，未读取新消息" }), true);
+    await pauseActiveBridge(String(error), error.code || "BRIDGE_RECEIVE_FAILED");
+    return jsonResult(`读取网页消息失败，连接已暂停：${String(error)}`, publicBridgeLink({
+      received: false,
+      state: "paused",
+      reason: String(error),
+      requires_resume: true,
+      failure: activeBridgeLink.failure,
+    }), true);
   }
 }
 
 async function bridgeRun(args = {}) {
   if (!activeBridgeLink) return jsonResult("还没有建立网页端连接", { started: false, state: "idle" }, true);
+  const relayState = activeRelayEngine?.status?.().state;
+  if (activeBridgeLink.state === "paused" || relayState === "paused") {
+    const reason = activeBridgeLink.failure?.reason || activeRelayEngine?.status?.().last_stop || "网页桥接已暂停";
+    return jsonResult(`网页桥接已暂停，未启动搬运：${reason}`, publicBridgeLink({
+      started: false,
+      state: "paused",
+      reason,
+      requires_resume: true,
+    }), true);
+  }
   const config = activeBridgeLink.config || normalizeRelayConfig(args);
   const goal = String(args.goal || config.goal || "").trim();
   if (!goal) {
@@ -3412,12 +3593,12 @@ async function bridgeRun(args = {}) {
     runRecord.finished_at = new Date().toISOString();
     if (activeBridgeLink) activeBridgeLink.state = runRecord.state;
     return result;
-  }).catch(error => {
+  }).catch(async error => {
     runRecord.state = "paused";
     runRecord.status = "failed";
     runRecord.error = String(error);
     runRecord.finished_at = new Date().toISOString();
-    if (activeBridgeLink) activeBridgeLink.state = "paused";
+    if (activeBridgeLink) await pauseActiveBridge(String(error), error.code || "BRIDGE_RUN_FAILED");
     return { started: true, status: "blocked", state: "paused", reason: String(error) };
   });
   runRecord.promise = operation;
@@ -4302,6 +4483,15 @@ const TOOLS = [
     }, required: ["route_id"] },
   },
   {
+    name: "codex_source_thread_read",
+    description: "Read another explicit codex://threads/<id> conversation as bounded, read-only source content. It never binds that conversation as the current worker or sends a message to it.",
+    inputSchema: { type: "object", properties: {
+      route_id: { type: "string" },
+      thread_url: { type: "string", description: "Explicit codex://threads/<thread-id> URL from the source Codex conversation." },
+      max_chars: { type: "integer", default: 12000, maximum: 24000 },
+    }, required: ["route_id", "thread_url"] },
+  },
+  {
     name: "chatgpt_browser_session_create",
     description: "Create a persistent bridge session that owns one selected web brain browser tab. Use a different session_id for each independent task; do not delete sessions through the bridge.",
     inputSchema: { type: "object", properties: {
@@ -4565,6 +4755,7 @@ const ROUTED_TOOLS = new Set([
   "codex_thread_start",
   "codex_thread_turn",
   "codex_thread_read",
+  "codex_source_thread_read",
 ]);
 
 // Public bridge state must not live in the parent MCP process. A separate
@@ -4627,6 +4818,7 @@ async function callToolDirect(name, args) {
   if (name === "codex_thread_start") return codexThreadStart(args);
   if (name === "codex_thread_turn") return codexThreadTurn(args);
   if (name === "codex_thread_read") return codexThreadRead(args);
+  if (name === "codex_source_thread_read") return codexSourceThreadRead(args);
   if (name === "chatgpt_browser_session_create" || name === "brain_browser_session_create") return createSession(args);
   if (name === "chatgpt_browser_session_list" || name === "brain_browser_session_list") return listSessions();
   if (name === "chatgpt_browser_launch" || name === "brain_browser_launch") return jsonResult("dedicated browser launched; sign in manually", launchBrowser(args));

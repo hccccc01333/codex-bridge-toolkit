@@ -3,6 +3,51 @@ import readline from "node:readline";
 
 const DEFAULT_TIMEOUT_MS = 120000;
 
+export function defaultCodexCommand({ platform = process.platform, env = process.env } = {}) {
+  const override = String(env?.CODEX_BRIDGE_CODEX_COMMAND || "").trim();
+  if (override) return override;
+  return platform === "win32" ? "codex.cmd" : "codex";
+}
+
+function quoteWindowsCommandArgument(value) {
+  const text = String(value);
+  if (!/[\s"&|<>^()]/.test(text)) return text;
+  return `"${text.replaceAll('"', '\\"')}"`;
+}
+
+export function codexSpawnSpec(command, args = [], { platform = process.platform, env = process.env } = {}) {
+  const normalizedCommand = String(command || "").trim() || defaultCodexCommand({ platform });
+  const normalizedArgs = Array.isArray(args) ? [...args] : [];
+  if (platform === "win32" && /\.(cmd|bat)$/i.test(normalizedCommand)) {
+    const commandLine = [normalizedCommand, ...normalizedArgs].map(quoteWindowsCommandArgument).join(" ");
+    return {
+      command: env?.ComSpec || env?.COMSPEC || "cmd.exe",
+      args: ["/d", "/s", "/c", commandLine],
+      options: {},
+    };
+  }
+  if (platform === "win32" && /\.ps1$/i.test(normalizedCommand)) {
+    return {
+      command: "powershell.exe",
+      args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", normalizedCommand, ...normalizedArgs],
+      options: {},
+    };
+  }
+  return { command: normalizedCommand, args: normalizedArgs, options: {} };
+}
+
+export function codexThreadIdFromUrl(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    if (url.protocol !== "codex:" || url.hostname.toLowerCase() !== "threads") return null;
+    const segments = url.pathname.split("/").filter(Boolean);
+    if (segments.length !== 1 || !/^[A-Za-z0-9][A-Za-z0-9-]{7,127}$/.test(segments[0])) return null;
+    return segments[0];
+  } catch {
+    return null;
+  }
+}
+
 function textFromItem(item) {
   if (!item || typeof item !== "object") return "";
   if (typeof item.text === "string") return item.text;
@@ -13,7 +58,7 @@ function textFromItem(item) {
 
 export class CodexAdapter {
   constructor({
-    command = "codex",
+    command = undefined,
     args = ["app-server", "--listen", "stdio://"],
     cwd = process.cwd(),
     env = process.env,
@@ -22,7 +67,7 @@ export class CodexAdapter {
     timeoutMs = DEFAULT_TIMEOUT_MS,
     onNotification = null,
   } = {}) {
-    this.command = command;
+    this.command = String(command || defaultCodexCommand({ env })).trim();
     this.args = args;
     this.cwd = cwd;
     this.env = env;
@@ -46,10 +91,12 @@ export class CodexAdapter {
     this.lastError = null;
     let child;
     try {
-      child = this.spawnImpl(this.command, this.args, {
+      const spawnSpec = codexSpawnSpec(this.command, this.args, { env: this.env });
+      child = this.spawnImpl(spawnSpec.command, spawnSpec.args, {
         cwd: this.cwd,
         env: this.env,
         stdio: ["pipe", "pipe", "pipe"],
+        ...spawnSpec.options,
       });
     } catch (error) {
       this.state = "unavailable";
