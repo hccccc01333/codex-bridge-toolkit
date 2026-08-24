@@ -1,6 +1,6 @@
-# 🔗 Codex ↔ 网页大模型对话桥接
+# 🧰 Codex Bridge Toolkit Series
 
-> 只在 Codex 里说话，插件负责连接网页大模型、搬运消息并安全控制循环。
+> 只在 Codex 里说话；插件系列负责连接网页大模型、检查浏览器和读取本地 GitHub 工作区。
 
 **语言：中文（默认） · [English](README.en.md)**
 
@@ -27,6 +27,38 @@ Codex / DeepSeek API             本地执行手
 ```
 
 不使用 ChatGPT API，不访问私有网页接口，不提取 Cookie 或密码。浏览器始终可见，用户自行完成登录。
+
+## 插件系列工具包
+
+这个仓库现在是一个可扩展的本地优先工具包系列，默认安装一次即可使用：
+
+| 工具包 | 用途 |
+| --- | --- |
+| Web LLM Conversation Bridge | 连接 ChatGPT/DeepSeek 网页端，让网页大脑规划审查、Codex 在本地执行 |
+| Browser Watchdog | 只读检查多个网页会话是否登录、加载、生成或卡死 |
+| GitHub Workspace | 只读读取当前本地 Git/GitHub 仓库状态，作为执行和审查上下文 |
+
+常用说法：
+
+```text
+列出这个插件的工具包
+查看所有 Codex 和网页端连接
+检查 ChatGPT 标签页是否卡住
+检查当前 GitHub 工作区
+```
+
+每个 Codex 对话和网页对话的连接会独立保存；用户只看连接名称、模型、网页对话标题和状态，不需要管理 `session_id`、`targetId` 或 `route_id`。完整说明见 [插件系列工具包](docs/toolkit-series.md)。
+
+### 按需求选择工具包
+
+| 你的目的 | 在 Codex 中说 | 默认副作用 |
+| --- | --- | --- |
+| 让网页模型规划、审查本地任务 | `连接 ChatGPT 网页端` | 只在用户确认后发送网页消息 |
+| 检查网页会话是否卡住 | `检查 ChatGPT 标签页是否卡住` | 只读，不切换标签页、不重发消息 |
+| 持续监控一个网页会话 | `启动“论文 ChatGPT”浏览器守护，每 15 秒检查一次` | 只在当前 MCP 进程监控 |
+| 查看当前 GitHub 仓库 | `检查当前 GitHub 工作区` | 只读，不 pull/push/commit |
+
+浏览器守护在 MCP 进程重启后需要重新启动；它不会伪装成已经恢复，也不会后台自动续接网页会话。
 
 ## 安装后第一次使用
 
@@ -255,13 +287,13 @@ The plugin includes a status-only two-column panel for hosts that support MCP UI
 
 The `bridge_panel` tool renders the panel inside the current Codex conversation when the host supports UI resources. The host conversation is the binding boundary: a panel rendered in Codex conversation A belongs to A, and a panel rendered in conversation B belongs to B. The UI is arranged as two status columns: Codex on the left and the selected web conversation on the right, joined by a dashed link and a connection marker.
 
-The current plugin boundary does not expose the host Codex conversation title or complete task history to the bridge, so the UI says `当前 Codex 对话` instead of fabricating a title or exposing a thread ID. The panel only visualizes the connection state and selected destination. It does not show message bodies, ask questions, create goals, or provide connection controls; those actions happen in the Codex conversation.
+如果 MCP 宿主在请求元数据中提供当前 Codex conversation context，插件会把当前可见对话绑定到该 route，并在面板显示“当前 Codex 对话”；如果宿主没有提供，插件会明确显示“插件托管的 Codex Worker”，不会猜测 thread ID。面板只可视化连接状态和目标，不显示消息、不提问、不创建目标；这些动作仍然在 Codex 对话中完成。
 
 ### Codex 原生 Goal 同步
 
 连接成功后，Codex 会在对话中询问本次任务目标。调用 `bridge_goal_create` 后，插件会保存 Bridge Goal；在指定轮次或持续模式下，它还会自动创建/恢复内部 Codex Worker，并通过官方 App Server 的 `thread/goal/set` 写入原生 Goal。`bridge_goal_create` 的返回结果包含 `native_goal.synced`，只有这个字段为 `true` 才表示原生 Goal 已成功写入。
 
-这里的“原生 Goal”指插件管理的 Codex Worker thread。当前 MCP 宿主没有把用户眼前的 Desktop 对话 thread ID 交给插件，所以插件不会猜测或修改另一个 Desktop 对话的隐藏 Goal。单次模式不会为了发一次消息额外启动 Worker；后续 `bridge_run` 启动 Worker 时会自动重试同步。详见 [Codex 原生集成边界](docs/codex-native-integration.md)。
+这里的“原生 Goal”默认指插件管理的 Codex Worker thread；如果 MCP 宿主提供并验证了当前可见 Codex thread，则会绑定并恢复当前对话。没有宿主上下文时，插件不会猜测或修改另一个 Desktop 对话的隐藏 Goal。单次模式不会为了发一次消息额外启动 Worker；后续 `bridge_run` 启动 Worker 时会自动重试同步。详见 [Codex 原生集成边界](docs/codex-native-integration.md)。
 
 If the current Codex host does not render MCP UI resources yet, use `bridge_panel` with `external: true` to open the legacy loopback panel. That fallback talks only to `127.0.0.1` through a random per-launch token and does not replace the visible login flow. A truly native Desktop panel requires a Codex host extension point or a maintained Codex Fork; see [the native integration boundary](docs/codex-native-integration.md).
 
@@ -529,6 +561,15 @@ This project is not:
 - a centralized conversation-history server
 
 ## Tool reference
+
+### Toolkit series
+
+- `bridge_toolkit_list`：查看已安装的工具包系列和安全边界
+- `bridge_toolkit_status`：查看工具包状态、所有人类可读连接和浏览器守护
+- `bridge_link_list`：查看独立 Codex ↔ 网页端连接
+- `browser_watchdog_scan`：单次只读检查一个网页标签页
+- `browser_watchdog_start` / `browser_watchdog_status` / `browser_watchdog_stop`：启动、查看、停止只读浏览器守护
+- `github_workspace_status`：读取本地 Git/GitHub 工作区摘要，不执行 Git 写操作
 
 ### Web browser
 

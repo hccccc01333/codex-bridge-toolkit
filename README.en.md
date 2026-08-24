@@ -1,6 +1,6 @@
-# 🔗 Codex ↔ Web LLM Conversation Bridge
+# 🧰 Codex Bridge Toolkit Series
 
-> Talk only in Codex. The plugin connects a visible web LLM, relays messages, and controls the execution loop safely.
+> Talk only in Codex. The toolkit series connects visible web LLMs, monitors browser health, and reads local GitHub workspace context safely.
 
 **Language: [中文（默认）](README.md) · English**
 
@@ -27,6 +27,38 @@ Codex / DeepSeek API                Local executor
 ```
 
 The bridge does not use the ChatGPT API, private web endpoints, cookie extraction, or password collection. The browser remains visible and the user completes login manually.
+
+## Toolkit series
+
+This repository is now an extensible local-first toolkit series, installed as one Codex plugin:
+
+| Toolkit | Purpose |
+| --- | --- |
+| Web LLM Conversation Bridge | Connect ChatGPT/DeepSeek Web so the web brain plans/reviews and Codex executes locally |
+| Browser Watchdog | Read-only checks for login, loading, generation, composer failure, or an unresponsive web session |
+| GitHub Workspace | Read-only local Git/GitHub repository context for execution and review |
+
+Useful natural-language requests include:
+
+```text
+List the toolkits in this plugin.
+Show all Codex ↔ web links.
+Check whether the ChatGPT tab is stuck.
+Inspect the current GitHub workspace.
+```
+
+Each Codex conversation and web conversation can have an independent persisted link. Users see names, providers, web conversation titles, and status; `session_id`, `targetId`, and `route_id` stay internal. See [Toolkit series](docs/toolkit-series.md).
+
+### Choose by intent
+
+| Goal | Say this in Codex | Default side effect |
+| --- | --- | --- |
+| Let a web model plan/review a local task | `Connect to ChatGPT Web.` | Sends only after the bridge workflow is confirmed |
+| Check whether a web session is stuck | `Check whether the ChatGPT tab is stuck.` | Read-only; no tab switch or resend |
+| Monitor one web session periodically | `Start a browser watchdog named “paper ChatGPT” every 15 seconds.` | Monitors only the current MCP process |
+| Inspect the current GitHub repository | `Inspect the current GitHub workspace.` | Read-only; no pull/push/commit |
+
+Watchdogs must be started again after the MCP process restarts. They never pretend to have resumed and never silently continue a web session in the background.
 
 ## First use after installation
 
@@ -203,13 +235,13 @@ Open the web bridge panel.
 
 The `bridge_panel` tool renders the panel inside the current Codex conversation when the host supports UI resources. The host conversation is the binding boundary: a panel rendered in Codex conversation A belongs to A, and a panel rendered in conversation B belongs to B. Codex is shown on the left and the selected web conversation on the right, joined by a dashed link and a connection marker.
 
-The current plugin boundary does not expose the host Codex conversation title or complete task history to the bridge, so the UI uses `Current Codex conversation` instead of fabricating a title or exposing a thread ID. The panel only visualizes connection state and the selected destination. It does not show message bodies, ask questions, create goals, or provide connection controls; those actions happen in the Codex conversation.
+When the MCP host provides the current Codex conversation context in request metadata, the bridge binds that visible conversation to the route and shows `Current Codex conversation`. When the host does not provide it, the bridge explicitly shows `Plugin-managed Codex Worker` instead of guessing a thread ID. The panel only visualizes connection state and destination; messages, questions, goals, and controls remain in the Codex conversation.
 
 ### Native Codex Goal synchronization
 
 After the web connection is ready, Codex asks the user for the task objective. `bridge_goal_create` persists the Bridge Goal; in bounded or continuous mode it also creates or resumes the internal Codex Worker and writes the native Goal through the official App Server `thread/goal/set` method. The result includes `native_goal.synced`; only `true` means the native Goal was written successfully.
 
-“Native Goal” here means the Goal on the Codex Worker thread managed by the plugin. The current MCP host does not provide the hidden thread ID of the visible Desktop conversation, so the plugin does not guess or mutate another Desktop task. One-shot mode does not start a Worker just to send one message; `bridge_run` retries synchronization when it starts the Worker later. See [the native integration boundary](docs/codex-native-integration.md).
+“Native Goal” normally means the Goal on the Codex Worker thread managed by the plugin. If the MCP host provides and the bridge verifies the current visible Codex thread, the route resumes and binds that conversation instead. Without host context, the plugin does not guess or mutate another Desktop task. One-shot mode does not start a Worker just to send one message; `bridge_run` retries synchronization when it starts the Worker later. See [the native integration boundary](docs/codex-native-integration.md).
 
 If the host does not render MCP UI resources, use compatibility mode. It opens the legacy loopback panel on `127.0.0.1` with a random per-launch token. A truly native Desktop panel requires a Codex host extension point or a maintained Codex fork; see [the native integration boundary](docs/codex-native-integration.md).
 
@@ -390,6 +422,17 @@ The bridge automatically pauses when the browser, tab, provider, conversation, o
 ## Tool reference
 
 Most users only need natural-language requests in the Codex conversation.
+
+### Toolkit series tools
+
+- `bridge_toolkit_list`
+- `bridge_toolkit_status`
+- `bridge_link_list`
+- `browser_watchdog_scan`
+- `browser_watchdog_start`
+- `browser_watchdog_status`
+- `browser_watchdog_stop`
+- `github_workspace_status`
 
 ### End-user bridge tools
 

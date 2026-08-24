@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "chatgptWebBridge": {
-      "title": "ChatGPT Web Bridge",
-      "description": "Relays explicit prompts through a user-logged-in ChatGPT Web browser session.",
+      "title": "Codex Bridge Toolkit Series",
+      "description": "Visible Web LLM bridge, browser watchdog, multi-link status, and read-only GitHub workspace diagnostics.",
       "cwd": ".",
       "command": "node",
       "args": [

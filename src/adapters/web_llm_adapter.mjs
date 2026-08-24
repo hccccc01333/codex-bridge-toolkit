@@ -63,7 +63,10 @@ export function createWebLLMAdapter(profile) {
           input,
           send: Boolean(document.querySelector(input) && (sendSelectors.some(selector => document.querySelector(selector)) || sendByLabel)),
         }));
-        return { ok: strategies.some(item => item.send), provider: ${JSON.stringify(profile.id)}, strategies };
+        // An empty composer may legitimately show the voice control instead
+        // of the send control. Health means that the composer is usable; the
+        // send control is verified again after the prompt has been inserted.
+        return { ok: strategies.some(item => Boolean(document.querySelector(item.input))), provider: ${JSON.stringify(profile.id)}, strategies };
       })()`;
     },
     findComposer(document) {

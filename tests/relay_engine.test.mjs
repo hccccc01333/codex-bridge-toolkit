@@ -48,3 +48,20 @@ test("relay engine pauses on destination mismatch and deduplicates inbound messa
   assert.equal(second.new_message, false);
   assert.equal(calls, 2);
 });
+
+test("relay engine does not start another round after an explicit pause", async () => {
+  let rounds = 0;
+  let engine;
+  engine = createRelayEngine({
+    config: { rounds: 3, goal: "finish" },
+    executeRound: async () => {
+      rounds += 1;
+      await engine.pause("user pause");
+      return { status: "continue" };
+    },
+  });
+  const result = await engine.run();
+  assert.equal(rounds, 1);
+  assert.equal(result.status, "paused");
+  assert.equal(result.last_stop, "user pause");
+});

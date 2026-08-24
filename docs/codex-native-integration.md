@@ -12,12 +12,12 @@
 
 官方参考：[Codex App Server](https://learn.chatgpt.com/docs/app-server)。
 
-仍需区分两个 thread：
+仍需区分两个 thread；插件现在会优先使用 MCP 宿主明确提供的当前对话上下文：
 
 1. **插件管理的 Codex Worker thread**：插件可以创建/恢复它，并可靠地写入原生 Goal。
-2. **用户眼前的 Codex Desktop 对话 thread**：当前 MCP 宿主没有把这个 thread ID 传给插件，因此插件不会猜测或修改它的隐藏状态。
+2. **用户眼前的 Codex Desktop 对话 thread**：如果宿主在 MCP 请求元数据中提供 thread ID，插件会将 route 绑定到它并在每次恢复时校验；如果宿主没有提供，插件会显示为“插件托管的 Codex Worker”，不会猜测或修改 Desktop 对话。
 
-这意味着“原生 Goal 已同步”代表 Worker thread 已同步，不代表插件能够修改当前 Desktop 对话顶部的 Goal。目标不确定、Worker 启动失败或目标写入失败时，插件会返回 `pending`/错误状态，不会伪造成功。
+因此 `codex_binding.source=current_codex_conversation` 才表示当前可见 Codex 对话已绑定；`managed_worker` 表示插件创建或恢复了独立 Worker。目标不确定、Worker 启动失败或目标写入失败时，插件会返回 `pending`/错误状态，不会伪造成功。
 
 ## `bridge_goal_create` 的同步流程
 

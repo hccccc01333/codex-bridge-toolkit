@@ -13,9 +13,12 @@ const {
   enqueueRouteAction,
   controlPlaneCapabilities,
   newRouteRecord,
+  readWebDelivery,
+  removeWebDelivery,
   readRoute,
   routeQueueState,
   updateRoute,
+  writeWebDelivery,
   writeRoute,
 } = controlPlane;
 
@@ -52,11 +55,60 @@ test("route metadata preserves the selected brain and executor providers", () =>
   assert.equal(summary.executor_profile, "my-deepseek");
 });
 
+test("route metadata preserves the Codex conversation binding source", () => {
+  resetRoute("visible-codex-route", {
+    codex_thread_id: "visible-thread",
+    codex_binding: {
+      state: "bound",
+      source: "current_codex_conversation",
+      title: "当前 Codex 对话",
+      verified: true,
+    },
+  });
+  const summary = controlPlane.routeSummary(readRoute("visible-codex-route"));
+  assert.equal(summary.codex_thread_id, "visible-thread");
+  assert.equal(summary.codex_binding.source, "current_codex_conversation");
+  assert.equal(summary.codex_binding.verified, true);
+});
+
 test("route status reports whether serialization is cross-process", () => {
   const capabilities = controlPlaneCapabilities();
   const queue = routeQueueState("test-alpha");
   assert.equal(queue.distributed_lock_available, capabilities.distributed_lock);
+  assert.equal(capabilities.durable_web_delivery_ledger, capabilities.distributed_lock);
   assert.equal(queue.serialization_scope, capabilities.serialization_scope);
+});
+
+test("web delivery records survive a second control-plane process", async () => {
+  const deliveryId = `delivery-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  writeWebDelivery(deliveryId, {
+    route_id: "delivery-route",
+    provider: "chatgpt",
+    target_id: "target-test",
+    conversation_url: "https://chatgpt.com/c/test",
+    state: "unknown",
+    prompt_length: 12000,
+    original_prompt_length: 24000,
+  });
+  const worker = path.resolve("tests/delivery_worker.mjs");
+  const child = await new Promise((resolve, reject) => {
+    const childProcess = spawn(process.execPath, [worker, deliveryId], {
+      cwd: process.cwd(),
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    childProcess.stdout.on("data", chunk => { stdout += chunk.toString(); });
+    childProcess.stderr.on("data", chunk => { stderr += chunk.toString(); });
+    childProcess.on("error", reject);
+    childProcess.on("close", code => code === 0 ? resolve(JSON.parse(stdout.trim())) : reject(new Error(stderr || `worker exited ${code}`)));
+  });
+  assert.equal(child.delivery_id, deliveryId);
+  assert.equal(child.state, "unknown");
+  assert.equal(child.original_prompt_length, 24000);
+  removeWebDelivery(deliveryId);
+  assert.equal(readWebDelivery(deliveryId), null);
 });
 
 test("T8 actions for one route are serialized", async () => {

@@ -125,7 +125,9 @@ export function selectorHealthScript(providerOrId = DEFAULT_BRAIN_PROVIDER) {
       send: Boolean(document.querySelector(input) && (sendSelectors.some(selector => document.querySelector(selector)) || sendByLabel)),
     }));
     return {
-      ok: strategies.some(item => item.send),
+      // A blank composer can expose a voice control instead of a send button.
+      // The send control is checked after text insertion, not during health.
+      ok: strategies.some(item => Boolean(document.querySelector(item.input))),
       provider: ${JSON.stringify(provider.id)},
       strategies,
     };

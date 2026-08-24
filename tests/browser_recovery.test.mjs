@@ -23,3 +23,21 @@ test("automatic dedicated-browser launch checks for an existing profile first", 
   assert.match(serverSource, /const alreadyRunning = existing\.some\(candidate => candidate\.userDataDir/);
   assert.match(serverSource, /dedicated browser is already running but its debugging endpoint is not ready/);
 });
+
+test("web sends use a same-tab delivery guard and do not return an unstable previous reply", () => {
+  assert.match(serverSource, /await ensureConnected\(port, activeSession, provider, \{ allowCreate: false \}\);/);
+  assert.match(serverSource, /const WEB_DELIVERY_FILE|readWebDelivery\(deliveryKey\)/);
+  assert.match(serverSource, /delivery_state: "unknown"/);
+  assert.match(serverSource, /retry_allowed: false/);
+  assert.match(serverSource, /createReplyTracker\(before/);
+  assert.match(serverSource, /observeReply\(tracker, state, Date\.now\(\)\)/);
+  assert.doesNotMatch(serverSource, /last: previous/);
+});
+
+test("Codex binding consumes host context when available and fails closed on mismatch", () => {
+  assert.match(serverSource, /function hostCodexContextFromRequest\(/);
+  assert.match(serverSource, /__host_codex_context/);
+  assert.match(serverSource, /source: "current_codex_conversation"/);
+  assert.match(serverSource, /CODEX_THREAD_BINDING_MISMATCH/);
+  assert.match(serverSource, /source: "managed_worker"/);
+});

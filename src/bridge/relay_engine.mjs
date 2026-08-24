@@ -123,6 +123,9 @@ export function createRelayEngine({
       ? state.rounds
       : Math.max(1, Number(input.safety_limit ?? safetyLimit) || 1000);
     for (let index = 0; index < limit; index += 1) {
+      if (state.state === "paused" || state.state === "disconnected" || state.state === "blocked" || state.state === "completed") {
+        return { started: true, status: state.state, ...state };
+      }
       if (!(await verify())) return { started: true, ...state };
       state.round = index;
       const result = await executeRound({ ...input, context, constraints, round: index, goal });

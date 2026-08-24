@@ -20,7 +20,10 @@ import {
   routeIdOf,
   routeQueueState,
   routeSummary,
+  readWebDelivery,
+  removeWebDelivery,
   updateRoute,
+  writeWebDelivery,
   writeRoute,
 } from "./control_plane.mjs";
 import {
@@ -68,7 +71,18 @@ import {
 } from "../src/bridge/relay_contract.mjs";
 import { compileUserGoal } from "../src/bridge/goal_compiler.mjs";
 import { createRelayEngine } from "../src/bridge/relay_engine.mjs";
+import {
+  WEB_PROMPT_MAX_CHARS,
+  WEB_REPLY_MIN_STABLE_MS,
+  WEB_REPLY_STABLE_POLLS,
+  compactWebPrompt,
+  createReplyTracker,
+  observeReply,
+} from "../src/bridge/web_reply_tracker.mjs";
 import { createPanelServer } from "./panel_server.mjs";
+import { TOOLKIT_SERIES_VERSION, listToolkits } from "../src/toolkits/registry.mjs";
+import { inspectGithubWorkspace } from "../src/toolkits/github_workspace.mjs";
+import { scanBrowser } from "../src/toolkits/browser_watchdog.mjs";
 import {
   browserInstanceFromEndpoint,
   discoveryText,
@@ -152,10 +166,67 @@ let activeRoute = null;
 const codexAdapters = new Map();
 let activeBridgeLink = null;
 let activeRelayEngine = null;
+let activeBridgeRun = null;
 let activePanel = null;
 let pendingDedicatedLaunch = null;
+const watchdogRuns = new Map();
 const pendingBrainTargetCreation = new Map();
 const execFileAsync = promisify(execFile);
+
+function normalizeHostCodexContext(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const threadId = String(raw.thread_id || raw.threadId || raw.codex_thread_id || raw.codexThreadId || "").trim();
+  const title = String(raw.title || raw.name || raw.conversation_title || raw.conversationTitle || "").trim();
+  if (!threadId && !title) return null;
+  return {
+    thread_id: threadId || null,
+    title: title || null,
+    source: "codex_host_context",
+  };
+}
+
+function hostCodexContextOf(args = {}) {
+  return normalizeHostCodexContext(args.__host_codex_context || args.host_codex_context || args.codex_context);
+}
+
+function codexBindingView(route = activeRoute) {
+  const binding = route?.codex_binding;
+  if (binding?.source === "current_codex_conversation") {
+    return {
+      state: "bound",
+      source: "current_codex_conversation",
+      label: binding.title || "当前 Codex 对话",
+      verified: Boolean(binding.verified),
+    };
+  }
+  if (route?.codex_thread_id) {
+    return {
+      state: "managed_worker",
+      source: "managed_worker",
+      label: "插件托管的 Codex Worker",
+      verified: Boolean(binding?.verified),
+    };
+  }
+  return {
+    state: "unbound",
+    source: "host_context_unavailable",
+    label: "尚未绑定当前 Codex 对话",
+    verified: false,
+  };
+}
+
+function hostCodexContextFromRequest(message = {}) {
+  const params = message.params || {};
+  const meta = params._meta || params.meta || message._meta || {};
+  return normalizeHostCodexContext(
+    meta.codex_context
+    || meta.codexContext
+    || params.codex_context
+    || params.codexContext
+    || params.host_context
+    || params.hostContext,
+  );
+}
 
 let brainState = createBrainState(DEFAULT_MAX_ROUNDS);
 
@@ -409,6 +480,180 @@ function executorProviderList() {
   });
 }
 
+function publicToolkitLink(route) {
+  const session = listStoredSessions().find(item => item.session_id === route.session_id);
+  const conversation = session?.conversation;
+  const binding = route.codex_binding;
+  return {
+    label: route.name || session?.name || "未命名连接",
+    state: route.status || "idle",
+    brain_provider: route.brain_provider || DEFAULT_BRAIN_PROVIDER,
+    executor_provider: route.executor_provider || DEFAULT_EXECUTOR_PROVIDER,
+    executor_model: route.executor_model || null,
+    conversation: conversation ? {
+      title: conversation.title || "当前网页对话",
+      url: conversation.url || null,
+    } : null,
+    codex: binding ? {
+      label: binding.title || (binding.source === "managed_worker" ? "插件托管 Worker" : "当前 Codex 对话"),
+      source: binding.source || "unknown",
+      verified: Boolean(binding.verified),
+    } : {
+      label: "尚未绑定 Codex 对话",
+      source: "unbound",
+      verified: false,
+    },
+    round: Number(route.round || session?.round || 0),
+    updated_at: route.updated_at || session?.updated_at || null,
+  };
+}
+
+function bridgeLinkList() {
+  return listRoutes().map(publicToolkitLink).sort((left, right) => left.label.localeCompare(right.label));
+}
+
+function toolkitCatalog() {
+  return jsonResult("Codex Bridge toolkit series", {
+    series_version: TOOLKIT_SERIES_VERSION,
+    default_toolkit: "web-bridge",
+    toolkits: listToolkits(),
+    links: bridgeLinkList(),
+    defaults: {
+      browser_automation: "visible_cdp_only",
+      github_actions: "read_only",
+      credential_handling: "never_collect_passwords_or_tokens",
+    },
+  });
+}
+
+function toolkitStatus() {
+  return jsonResult("Codex Bridge toolkit status", {
+    series_version: TOOLKIT_SERIES_VERSION,
+    toolkits: listToolkits().map(toolkit => ({
+      id: toolkit.id,
+      display_name: toolkit.display_name,
+      status: toolkit.status,
+      tools: toolkit.tools,
+    })),
+    links: bridgeLinkList(),
+    active_link: publicBridgeLink(),
+    watchdogs: [...watchdogRuns.values()].map(watchdogPublicView),
+  });
+}
+
+function watchdogPublicView(run) {
+  return {
+    name: run.name,
+    provider: run.provider,
+    port: run.port,
+    interval_ms: run.interval_ms,
+    lifecycle: run.lifecycle,
+    state: run.state,
+    checks: run.checks,
+    started_at: run.started_at,
+    last_checked_at: run.last_checked_at,
+    last_result: run.last_result || null,
+    error: run.error || null,
+  };
+}
+
+function watchdogArgs(args = {}) {
+  const tab = String(args.tab || "").trim();
+  return {
+    port: args.port,
+    provider: args.provider || args.brain_provider || DEFAULT_BRAIN_PROVIDER,
+    target_id: args.target_id || args.targetId,
+    target_title: args.target_title || args.targetTitle || (tab && !/^\d+$/.test(tab) ? tab : undefined),
+    target_url: args.target_url || args.targetUrl,
+    timeout_ms: args.timeout_ms,
+  };
+}
+
+async function browserWatchdogScan(args = {}) {
+  try {
+    const result = await scanBrowser(watchdogArgs(args));
+    return jsonResult(`浏览器守护检查：${result.state}`, result, !result.ok && result.state === "browser_unreachable");
+  } catch (error) {
+    return jsonResult(`浏览器守护检查失败：${String(error)}`, { ok: false, state: "watchdog_error" }, true);
+  }
+}
+
+async function browserWatchdogStart(args = {}) {
+  const name = String(args.name || args.label || "默认浏览器守护").trim().slice(0, 80) || "默认浏览器守护";
+  const existing = watchdogRuns.get(name);
+  if (existing?.lifecycle === "running") {
+    return jsonResult(`浏览器守护已在运行：${name}`, { started: false, already_running: true, watchdog: watchdogPublicView(existing) });
+  }
+  const interval = Math.min(Math.max(Number(args.interval_ms) || 15000, 5000), 10 * 60 * 1000);
+  const run = {
+    name,
+    provider: args.provider || args.brain_provider || DEFAULT_BRAIN_PROVIDER,
+    port: Number(args.port || DEFAULT_PORT),
+    interval_ms: interval,
+    lifecycle: "starting",
+    state: "starting",
+    checks: 0,
+    started_at: new Date().toISOString(),
+    last_checked_at: null,
+    last_result: null,
+    error: null,
+    timer: null,
+    in_flight: false,
+    args: watchdogArgs(args),
+  };
+  watchdogRuns.set(name, run);
+  const tick = async () => {
+    if (run.in_flight || run.lifecycle !== "running") return;
+    run.in_flight = true;
+    try {
+      const result = await scanBrowser(run.args);
+      run.checks += 1;
+      run.last_checked_at = new Date().toISOString();
+      run.last_result = result;
+      run.state = result.state;
+      run.error = null;
+    } catch (error) {
+      run.checks += 1;
+      run.last_checked_at = new Date().toISOString();
+      run.state = "watchdog_error";
+      run.error = String(error);
+    } finally {
+      run.in_flight = false;
+    }
+  };
+  run.lifecycle = "running";
+  await tick();
+  run.timer = setInterval(tick, interval);
+  return jsonResult(`浏览器守护已启动：${name}`, { started: true, watchdog: watchdogPublicView(run) });
+}
+
+function browserWatchdogStatus(args = {}) {
+  const name = String(args.name || args.label || "").trim();
+  const runs = name ? [...watchdogRuns.values()].filter(run => run.name === name) : [...watchdogRuns.values()];
+  return jsonResult("浏览器守护状态", {
+    running: runs.filter(run => run.lifecycle === "running").length,
+    watchdogs: runs.map(watchdogPublicView),
+  });
+}
+
+function browserWatchdogStop(args = {}) {
+  const name = String(args.name || args.label || "").trim();
+  if (!name) return jsonResult("请提供要停止的浏览器守护名称", { stopped: false }, true);
+  const run = watchdogRuns.get(name);
+  if (!run) return jsonResult(`未找到浏览器守护：${name}`, { stopped: false }, true);
+  if (run.timer) clearInterval(run.timer);
+  run.timer = null;
+  run.lifecycle = "stopped";
+  run.state = "stopped";
+  run.last_checked_at = run.last_checked_at || new Date().toISOString();
+  return jsonResult(`浏览器守护已停止：${name}`, { stopped: true, watchdog: watchdogPublicView(run) });
+}
+
+async function githubWorkspaceStatus(args = {}) {
+  const result = await inspectGithubWorkspace({ cwd: args.cwd || process.cwd() });
+  return jsonResult(result.ok ? `GitHub 工作区：${result.repository?.name || "本地仓库"}` : result.message, result, !result.ok);
+}
+
 function routeSessionIdOf(args = {}, route = null) {
   const explicitSession = args.session_id ?? args.sessionId;
   return normalizeSessionId(explicitSession || route?.session_id || route?.route_id || DEFAULT_SESSION_ID);
@@ -533,13 +778,22 @@ function routeCreate(args = {}) {
   catch (error) { return jsonResult(String(error), { created: false }, true); }
   try { executorProfile = normalizeCodexProfile(args.executor_profile ?? args.executorProfile ?? ""); }
   catch (error) { return jsonResult(String(error), { created: false }, true); }
+  const hostContext = hostCodexContextOf(args);
   const route = newRouteRecord(id, {
     name: args.name,
     brain_provider: brainProvider,
     executor_provider: executorProvider,
     executor_model: executorModel,
     executor_profile: executorProfile || null,
-    codex_thread_id: args.codex_thread_id ?? args.codexThreadId,
+    codex_thread_id: args.codex_thread_id ?? args.codexThreadId ?? hostContext?.thread_id,
+    codex_binding: hostContext?.thread_id ? {
+      state: "bound",
+      source: "current_codex_conversation",
+      thread_id: hostContext.thread_id,
+      title: hostContext.title || null,
+      verified: true,
+      bound_at: new Date().toISOString(),
+    } : null,
     session_id: sessionId,
     target_id: session.target_id,
     conversation_id: session.conversation?.id,
@@ -698,6 +952,13 @@ function codexAdapterStatus(args = {}) {
 async function codexThreadStart(args = {}) {
   let route = activateRoute(args);
   try {
+    const hostContext = hostCodexContextOf(args);
+    const explicitlyRequestedThread = args.codex_thread_id || args.codexThreadId || null;
+    if (hostContext?.thread_id && route.codex_binding?.thread_id && route.codex_binding.thread_id !== hostContext.thread_id) {
+      const error = new Error("当前 Codex 对话与该路由已绑定的 Worker 不一致；未切换执行线程");
+      error.code = "CODEX_THREAD_BINDING_MISMATCH";
+      throw error;
+    }
     const provider = executorProviderOf(args, route.executor_provider || DEFAULT_EXECUTOR_PROVIDER);
     const model = executorModelFor({ ...args, executor_model: args.executor_model ?? args.executorModel ?? args.model ?? route.executor_model }, provider);
     const profile = executorProfileFor(args, provider, model);
@@ -707,8 +968,12 @@ async function codexThreadStart(args = {}) {
       executor_profile: args.executor_profile ?? args.executorProfile ?? route.executor_profile ?? null,
     });
     const adapter = codexAdapterForRoute(route.route_id, provider.id, model, profile);
+    const requestedThreadId = explicitlyRequestedThread || route.codex_thread_id || hostContext?.thread_id || null;
+    const bindingSource = hostContext?.thread_id && requestedThreadId === hostContext.thread_id
+      ? "current_codex_conversation"
+      : route.codex_binding?.source || "managed_worker";
     const result = await adapter.startThread({
-      thread_id: args.codex_thread_id || route.codex_thread_id || null,
+      thread_id: requestedThreadId,
       cwd: args.cwd || process.cwd(),
       model,
       baseInstructions: args.base_instructions,
@@ -716,9 +981,18 @@ async function codexThreadStart(args = {}) {
     });
     const updated = updateRoute(route.route_id, {
       codex_thread_id: result.thread_id,
+      codex_binding: {
+        state: "bound",
+        source: bindingSource,
+        thread_id: result.thread_id,
+        title: hostContext?.title || route.codex_binding?.title || null,
+        verified: bindingSource === "current_codex_conversation",
+        bound_at: new Date().toISOString(),
+      },
       status: "worker_ready",
       last_action: "codex_thread_start",
     });
+    if (activeRouteId === route.route_id) activeRoute = updated;
     appendRouteEvent(route.route_id, {
       type: "CODEX_THREAD_READY",
       summary: `Codex thread ready: ${result.thread_id || "unknown"}`,
@@ -729,6 +1003,7 @@ async function codexThreadStart(args = {}) {
       executor_provider: provider.id,
       executor_model: model,
       executor_profile: profile || null,
+      codex_binding: codexBindingView(updated),
       route: routeSummary(updated),
       adapter: adapter.status(),
     });
@@ -935,6 +1210,13 @@ function brainStateView() {
 
 function resultText(result) {
   return result?.content?.find(item => item.type === "text")?.text || "";
+}
+
+function durableWebDelivery(deliveryId, fields = {}) {
+  return writeWebDelivery(deliveryId, {
+    route_id: activeRouteId,
+    ...fields,
+  });
 }
 
 async function brainPlan(args = {}) {
@@ -1847,10 +2129,19 @@ function publicBridgeLink(extra = {}) {
     rounds: activeBridgeLink.config?.rounds ?? null,
     goal: activeBridgeLink.goal || activeBridgeLink.config?.goal || brainState.goal || "",
     goal_source: activeBridgeLink.config?.goal_source || brainState.goal_source || "none",
+    codex_binding: codexBindingView(activeRoute),
     goal_status: activeBridgeLink.goal || activeBridgeLink.config?.goal || brainState.goal
       ? "attached"
       : activeBridgeLink.state === "awaiting_goal" ? "awaiting_user" : "none",
     native_goal: activeBridgeLink.native_goal || activeRoute?.native_goal || null,
+    run: activeBridgeRun ? {
+      state: activeBridgeRun.state,
+      status: activeBridgeRun.status || null,
+      round: activeBridgeRun.round ?? activeBridgeLink.round ?? 0,
+      started_at: activeBridgeRun.started_at,
+      finished_at: activeBridgeRun.finished_at || null,
+      error: activeBridgeRun.error || null,
+    } : null,
     requires_goal: !Boolean(activeBridgeLink.goal || activeBridgeLink.config?.goal || brainState.goal)
       && ["awaiting_goal", "connected", "ready"].includes(activeBridgeLink.state),
     ...extra,
@@ -1917,6 +2208,9 @@ function bridgeTabChoices(instance, provider, windowSelector = "") {
 }
 
 async function bridgeConnect(args = {}) {
+  if (!args.resume && activeBridgeRun?.state === "running") {
+    return jsonResult("已有网页端循环正在运行；请先暂停或断开当前连接，再建立新的 Codex ↔ 网页端绑定", publicBridgeLink({ connected: false, state: "running", connection_blocked: true }), true);
+  }
   if (args.resume && activeBridgeLink) {
     const health = await browserHealth({
       route_id: activeBridgeLink.route_id,
@@ -2016,8 +2310,11 @@ async function bridgeConnect(args = {}) {
     executor_provider: args.executor_provider,
     executor_model: args.executor_model,
     executor_profile: args.executor_profile,
+    __host_codex_context: hostCodexContextOf(args),
   });
   if (routeResult.isError) return routeResult;
+  activeRouteId = routeId;
+  activeRoute = readRoute(routeId);
 
   activeBridgeLink = {
     state: "browser_selected",
@@ -2032,6 +2329,7 @@ async function bridgeConnect(args = {}) {
     route_id: routeId,
     port: instance.port,
   };
+  const bridgeLink = activeBridgeLink;
   activeRelayEngine = createRelayEngine({
     config,
     relayId: routeId,
@@ -2066,9 +2364,9 @@ async function bridgeConnect(args = {}) {
       return result.structuredContent || result;
     },
     onStateChange: next => {
-      if (!activeBridgeLink) return;
-      activeBridgeLink.state = next.state;
-      activeBridgeLink.round = next.round;
+      if (activeBridgeLink !== bridgeLink) return;
+      bridgeLink.state = next.state;
+      bridgeLink.round = next.round;
     },
   });
   const opened = await openBrainBrowser({
@@ -2334,6 +2632,9 @@ async function bridgeRun(args = {}) {
       true,
     );
   }
+  if (activeBridgeRun?.state === "running") {
+    return jsonResult("网页端循环已经在后台运行，请使用网页端连接状态查看进度", publicBridgeLink({ started: false, already_running: true }));
+  }
   const route = readRoute(activeBridgeLink.route_id);
   if (!route.codex_thread_id) {
     const started = await codexThreadStart({
@@ -2350,7 +2651,18 @@ async function bridgeRun(args = {}) {
     objective: goal,
   });
   activeBridgeLink.native_goal = nativeGoal;
-  const result = await activeRelayEngine.run({
+  activeBridgeLink.state = "running";
+  const runRecord = {
+    state: "running",
+    status: "running",
+    round: activeBridgeLink.round || 0,
+    started_at: new Date().toISOString(),
+    finished_at: null,
+    error: null,
+    result: null,
+  };
+  activeBridgeRun = runRecord;
+  const operation = activeRelayEngine.run({
     goal,
     context: args.context,
     constraints: args.constraints,
@@ -2359,10 +2671,35 @@ async function bridgeRun(args = {}) {
     executor_model: args.executor_model,
     executor_profile: args.executor_profile,
     safety_limit: args.safety_limit,
+  }).then(result => {
+    runRecord.result = result;
+    runRecord.status = result.status || result.state || "completed";
+    runRecord.state = result.state || (runRecord.status === "completed" ? "completed" : "paused");
+    runRecord.round = result.round ?? activeBridgeLink?.round ?? runRecord.round;
+    runRecord.finished_at = new Date().toISOString();
+    if (activeBridgeLink) activeBridgeLink.state = runRecord.state;
+    return result;
+  }).catch(error => {
+    runRecord.state = "paused";
+    runRecord.status = "failed";
+    runRecord.error = String(error);
+    runRecord.finished_at = new Date().toISOString();
+    if (activeBridgeLink) activeBridgeLink.state = "paused";
+    return { started: true, status: "blocked", state: "paused", reason: String(error) };
   });
-  return jsonResult(result.status ? `网页端循环状态：${result.status}` : "网页端连接已准备好", publicBridgeLink({
-    started: Boolean(result.started),
-    result,
+  runRecord.promise = operation;
+  if (args.wait === true) {
+    const result = await operation;
+    return jsonResult(result.status ? `网页端循环状态：${result.status}` : "网页端连接已准备好", publicBridgeLink({
+      started: Boolean(result.started),
+      result,
+      native_goal: nativeGoal,
+      state: activeBridgeLink.state,
+    }), false);
+  }
+  return jsonResult("网页端循环已在后台启动；可继续使用 Codex，并通过连接状态查看进度", publicBridgeLink({
+    started: true,
+    background: true,
     native_goal: nativeGoal,
     state: activeBridgeLink.state,
   }), false);
@@ -2502,10 +2839,23 @@ async function pageSnapshot(provider = brainProviderOf()) {
   return evaluate(`(() => {
     const assistantSelectors = ${assistantSelectors};
     const assistantNodes = assistantSelectors.flatMap(selector => [...document.querySelectorAll(selector)]);
-    let messages = [...new Set(assistantNodes)].map(node => (node.innerText || '').trim()).filter(Boolean);
-    if (!messages.length) {
-      messages = [...document.querySelectorAll('article')].map(node => (node.innerText || '').trim()).filter(Boolean);
-    }
+    let nodes = [...new Set(assistantNodes)];
+    if (!nodes.length) nodes = [...document.querySelectorAll('article')];
+    // Scrape only the recent assistant messages. Scanning and returning the
+    // whole transcript on every 800ms poll made long conversations freeze the
+    // renderer and also made an old last message look like a new reply.
+    nodes = nodes.slice(-60);
+    const assistant_messages = nodes.map((node, index) => {
+      const explicitId = node.getAttribute('data-message-id')
+        || node.getAttribute('data-testid')
+        || node.id
+        || '';
+      const id = explicitId || ('assistant-' + index);
+      const raw = (node.innerText || '').trim();
+      const text = raw.length > 20000 ? raw.slice(0, 12000) + '\\n...[message clipped]\\n' + raw.slice(-7000) : raw;
+      return { id, text };
+    }).filter(message => message.text);
+    const messages = assistant_messages.map(message => message.text);
     const buttons = [...document.querySelectorAll('button')];
     const generatingTerms = ${generatingTerms};
     const buttonText = buttons.map(button => ((button.getAttribute('aria-label') || '') + ' ' + (button.innerText || '')).toLowerCase()).join(' ');
@@ -2514,7 +2864,7 @@ async function pageSnapshot(provider = brainProviderOf()) {
     const bodyText = (document.body?.innerText || '').slice(0, 3000);
     const lowerBody = bodyText.toLowerCase();
     const loginRequired = location.pathname.includes('/auth/') || ${loginTerms}.some(term => lowerBody.includes(term.toLowerCase()));
-    return { url: location.href, loginRequired, messages, last: messages.at(-1) || '', generating };
+    return { url: location.href, loginRequired, messages, assistant_messages, last: messages.at(-1) || '', generating };
   })()`);
 }
 
@@ -2579,19 +2929,50 @@ async function refreshBoundBrowserTab(port, provider, timeoutMs = 15000) {
 }
 
 async function askBrain(args = {}) {
-  const prompt = typeof args.prompt === "string" ? args.prompt.trim() : "";
-  if (!prompt) return jsonResult("prompt is required", { sent: false }, true);
+  const rawPrompt = typeof args.prompt === "string" ? args.prompt.trim() : "";
+  if (!rawPrompt) return jsonResult("prompt is required", { sent: false }, true);
   const port = portOf(args);
   const provider = brainProviderOf(args);
   const adapter = getWebLLMAdapter(provider.id);
   const profile = adapter.profile;
   const timeoutMs = Math.min(Math.max(Number(args.timeout_ms || 120000), 10000), 300000);
+  const promptInfo = compactWebPrompt(rawPrompt, { limit: WEB_PROMPT_MAX_CHARS });
+  const prompt = promptInfo.text;
+  let deliveryKey = "";
+  let submitted = false;
   try {
     ensureActiveSession(args);
     if (activeBridgeLink?.route_id === activeRouteId) await verifyBridgeDestination();
-    await ensureConnected(port, activeSession, provider);
+    // A bound route may only use its exact target. In particular, a timed-out
+    // send must not silently create a replacement tab on the next attempt.
+    await ensureConnected(port, activeSession, provider, { allowCreate: false });
+    deliveryKey = crypto.createHash("sha256").update(JSON.stringify({
+      provider: provider.id,
+      target_id: activeSession?.target_id || target?.id || "",
+      conversation_url: selectedConversation?.url || activeSession?.conversation?.url || target?.url || "",
+      prompt,
+    })).digest("hex");
+    const previousDelivery = readWebDelivery(deliveryKey);
+    if (previousDelivery) {
+      return jsonResult("duplicate web send blocked; the previous delivery is still completed or unresolved", {
+        sent: false,
+        retry_allowed: false,
+        delivery_state: previousDelivery.state,
+        delivery_id: deliveryKey,
+        target_preserved: true,
+      }, true);
+    }
+    durableWebDelivery(deliveryKey, {
+      state: "prepared",
+      provider: provider.id,
+      target_id: activeSession?.target_id || target?.id || null,
+      conversation_url: selectedConversation?.url || activeSession?.conversation?.url || target?.url || null,
+      prompt_length: prompt.length,
+      original_prompt_length: rawPrompt.length,
+    });
     let before = await pageSnapshot(provider);
     if (before.loginRequired) {
+      removeWebDelivery(deliveryKey);
       return jsonResult(`${provider.display_name} requires manual sign-in in the dedicated browser`, { sent: false, url: before.url, brain_provider: provider.id }, true);
     }
     const inputSelectorsLiteral = JSON.stringify(profile.input_selectors);
@@ -2607,9 +2988,8 @@ async function askBrain(args = {}) {
           return sendTerms.some(term => label.includes(term.toLowerCase()));
         });
       if (!input) return { ok: false, reason: 'input-not-found' };
-      if (!send) return { ok: false, reason: 'send-button-not-found', target_preserved: true };
       input.focus();
-      return { ok: true, tag: input.tagName, contenteditable: input.isContentEditable };
+      return { ok: true, send_available_before_insert: Boolean(send), tag: input.tagName, contenteditable: input.isContentEditable };
     })()`);
     let prepared = await preparePrompt();
     let refreshedSameTab = false;
@@ -2619,6 +2999,7 @@ async function askBrain(args = {}) {
         refreshedSameTab = true;
         before = await pageSnapshot(provider);
         if (before.loginRequired) {
+          removeWebDelivery(deliveryKey);
           return jsonResult(`${provider.display_name} requires manual sign-in after same-tab refresh`, {
             sent: false,
             refreshed_same_tab: true,
@@ -2629,6 +3010,7 @@ async function askBrain(args = {}) {
         }
         prepared = await preparePrompt();
       } catch (error) {
+        removeWebDelivery(deliveryKey);
         return jsonResult(`web composer unavailable after refreshing the same tab: ${String(error)}` , {
           sent: false,
           reason: error.code || "same_tab_refresh_failed",
@@ -2638,7 +3020,9 @@ async function askBrain(args = {}) {
         }, true);
       }
     }
-    if (!prepared?.ok) return jsonResult(
+    if (!prepared?.ok) {
+      removeWebDelivery(deliveryKey);
+      return jsonResult(
       refreshedSameTab
         ? `could not submit prompt after refreshing the same tab: ${prepared?.reason || "web UI changed"}; no new tab was opened`
         : prepared?.reason === "send-button-not-found"
@@ -2646,7 +3030,8 @@ async function askBrain(args = {}) {
         : `could not prepare prompt: ${prepared?.reason || "unknown"}`,
       { sent: false, reason: prepared?.reason || "unknown", target_preserved: prepared?.target_preserved !== false, replacement_opened: false, refreshed_same_tab: refreshedSameTab, browser_target_id: activeSession?.target_id || null },
       true,
-    );
+      );
+    }
 
     await cdpRaw("Input.dispatchKeyEvent", { type: "keyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
     await cdpRaw("Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: 2 });
@@ -2654,6 +3039,31 @@ async function askBrain(args = {}) {
     await cdpRaw("Input.dispatchKeyEvent", { type: "keyUp", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
     await cdpRaw("Input.insertText", { text: prompt });
     await new Promise(resolve => setTimeout(resolve, 250));
+    const inserted = await evaluate(`(() => {
+      const selectors = ${inputSelectorsLiteral};
+      const expected = ${JSON.stringify(prompt)};
+      const input = selectors.map(selector => document.querySelector(selector)).find(Boolean);
+      if (!input) return { ok: false, reason: 'input-not-found-after-insert' };
+      const actual = String(input.isContentEditable ? (input.innerText || '') : (input.value || '')).replace(/\\r\\n/g, '\\n');
+      return {
+        ok: actual === expected,
+        actual_length: actual.length,
+        expected_length: expected.length,
+        reason: actual === expected ? '' : 'composer-value-mismatch',
+      };
+    })()`);
+    if (!inserted?.ok) {
+      removeWebDelivery(deliveryKey);
+      return jsonResult(`web composer did not accept the complete prompt; nothing was sent`, {
+        sent: false,
+        reason: inserted?.reason || "composer-value-mismatch",
+        actual_length: inserted?.actual_length || 0,
+        expected_length: inserted?.expected_length || prompt.length,
+        prompt_truncated: promptInfo.truncated,
+        replacement_opened: false,
+        target_preserved: true,
+      }, true);
+    }
     const sendSelectorsLiteral = JSON.stringify(profile.send_selectors);
     const sendTermsLiteral = JSON.stringify(profile.send_terms);
     const generatingTermsLiteral = JSON.stringify(profile.generating_terms);
@@ -2668,36 +3078,162 @@ async function askBrain(args = {}) {
           return sendTerms.some(term => label.includes(term.toLowerCase())) && !generatingTerms.some(term => label.includes(term.toLowerCase()));
         });
       if (!send) return { ok: false, reason: 'send-button-not-found' };
+      if (send.disabled || send.getAttribute('aria-disabled') === 'true') return { ok: false, reason: 'send-button-disabled' };
       send.click();
       return { ok: true };
     })()`);
-    if (!sent?.ok) return jsonResult(`could not submit prompt: ${sent?.reason || "unknown"}`, { sent: false }, true);
+    if (!sent?.ok) {
+      removeWebDelivery(deliveryKey);
+      return jsonResult(`could not submit prompt: ${sent?.reason || "unknown"}`, { sent: false, target_preserved: true }, true);
+    }
+    submitted = true;
+    durableWebDelivery(deliveryKey, {
+      state: "submitted",
+    });
 
     const deadline = Date.now() + timeoutMs;
-    let previous = before.last;
-    let stablePolls = 0;
+    const tracker = createReplyTracker(before, {
+      stablePollsRequired: WEB_REPLY_STABLE_POLLS,
+      minStableMs: WEB_REPLY_MIN_STABLE_MS,
+    });
     while (Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 800));
       const state = await pageSnapshot(provider);
-      if (state.loginRequired) return jsonResult(`${provider.display_name} requested sign-in after submission`, { sent: true, brain_provider: provider.id }, true);
-      const changed = state.last && (state.last !== before.last || state.messages.length > before.messages.length);
-      if (changed && state.last === previous) stablePolls += 1;
-      else if (changed) { previous = state.last; stablePolls = 0; }
-      if (changed && !state.generating && stablePolls >= 2) {
-        const current = await currentConversationData(provider);
-        selectedConversation = current.is_conversation ? { id: current.id, title: current.title, url: current.url } : selectedConversation;
-        persistActiveSession();
-        return jsonResult(state.last, { sent: true, reply: state.last, url: state.url, brain_provider: provider.id, session_id: activeSessionId, browser_target_id: activeSession?.target_id || null });
+      if (state.loginRequired) {
+        durableWebDelivery(deliveryKey, { state: "unknown" });
+        return jsonResult(`${provider.display_name} requested sign-in after submission; the message may still be generating`, {
+          sent: true,
+          delivery_state: "unknown",
+          retry_allowed: false,
+          reply_available: false,
+          brain_provider: provider.id,
+          target_preserved: true,
+        }, true);
+      }
+      const replyState = observeReply(tracker, state, Date.now());
+      if (replyState.done) {
+        const replyText = replyState.candidate.text;
+        durableWebDelivery(deliveryKey, {
+          state: "completed",
+          reply_length: replyText.length,
+        });
+        // Conversation metadata is useful but must not turn an already
+        // completed delivery back into an unknown delivery when the sidebar
+        // is temporarily unavailable.
+        try {
+          const current = await currentConversationData(provider);
+          selectedConversation = current.is_conversation ? { id: current.id, title: current.title, url: current.url } : selectedConversation;
+          persistActiveSession();
+        } catch {}
+        return jsonResult(replyText, {
+          sent: true,
+          reply: replyText,
+          url: state.url,
+          brain_provider: provider.id,
+          session_id: activeSessionId,
+          browser_target_id: activeSession?.target_id || null,
+          delivery_state: "completed",
+          delivery_id: deliveryKey,
+          prompt_truncated: promptInfo.truncated,
+          original_prompt_length: promptInfo.originalLength,
+        });
       }
     }
     persistActiveSession();
-    return jsonResult(`timed out waiting for a stable ${provider.display_name} reply`, { sent: true, last: previous, brain_provider: provider.id, session_id: activeSessionId }, true);
+    durableWebDelivery(deliveryKey, {
+      state: "unknown",
+    });
+    return jsonResult(`timed out waiting for a stable ${provider.display_name} reply; the message may still be generating and was not resent`, {
+      sent: true,
+      delivery_state: "unknown",
+      retry_allowed: false,
+      reply_available: false,
+      brain_provider: provider.id,
+      session_id: activeSessionId,
+      browser_target_id: activeSession?.target_id || null,
+      delivery_id: deliveryKey,
+      prompt_truncated: promptInfo.truncated,
+      original_prompt_length: promptInfo.originalLength,
+    }, true);
   } catch (error) {
-    return jsonResult(String(error), { sent: false, port, session_id: activeSessionId }, true);
+    if (deliveryKey) {
+      if (submitted) {
+        durableWebDelivery(deliveryKey, {
+          state: "unknown",
+          error: String(error),
+        });
+      } else {
+        removeWebDelivery(deliveryKey);
+      }
+    }
+    return jsonResult(String(error), {
+      sent: submitted,
+      delivery_state: submitted ? "unknown" : "not_submitted",
+      retry_allowed: false,
+      port,
+      session_id: activeSessionId,
+      target_preserved: true,
+    }, true);
   }
 }
 
 const TOOLS = [
+  {
+    name: "bridge_toolkit_list",
+    description: "List the installable capabilities in the Codex Bridge toolkit series. The umbrella plugin stays one install; each toolkit is an independent feature group.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "bridge_toolkit_status",
+    description: "Show toolkit health, human-readable links between Codex conversations and web conversations, and active browser watchdogs without exposing routing IDs.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "bridge_link_list",
+    description: "List all persisted Codex ↔ web links by human-readable names. Separate links can use separate sessions and browser tabs; technical IDs remain internal.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "browser_watchdog_scan",
+    description: "Read-only health check for a visible Edge/Chrome web-LLM tab. Reports login, loading, composer, generation, selector, and responsiveness state. It never sends, retries, switches tabs, or opens a replacement tab.",
+    inputSchema: { type: "object", properties: {
+      provider: { type: "string", enum: listBrainProviders().map(provider => provider.id), default: DEFAULT_BRAIN_PROVIDER },
+      port: { type: "integer", minimum: 1, maximum: 65535, default: DEFAULT_PORT },
+      tab: { type: "string", description: "Visible tab title or exact URL. Required when more than one provider tab is present." },
+      target_title: { type: "string", description: "Exact visible tab title." },
+      target_url: { type: "string", description: "Exact visible tab URL." },
+      timeout_ms: { type: "integer", minimum: 500, maximum: 15000, default: 3500 },
+    } },
+  },
+  {
+    name: "browser_watchdog_start",
+    description: "Start a periodic, read-only browser watchdog in the current MCP process. It monitors one existing visible tab and reports degradation; it never auto-sends, auto-switches, or bypasses login. Stop it explicitly when no longer needed.",
+    inputSchema: { type: "object", properties: {
+      name: { type: "string", description: "Human-readable watchdog name, such as 论文 ChatGPT 标签页." },
+      provider: { type: "string", enum: listBrainProviders().map(provider => provider.id), default: DEFAULT_BRAIN_PROVIDER },
+      port: { type: "integer", minimum: 1, maximum: 65535, default: DEFAULT_PORT },
+      tab: { type: "string", description: "Visible tab title or exact URL." },
+      target_title: { type: "string" },
+      target_url: { type: "string" },
+      interval_ms: { type: "integer", minimum: 5000, maximum: 600000, default: 15000 },
+      timeout_ms: { type: "integer", minimum: 500, maximum: 15000, default: 3500 },
+    } },
+  },
+  {
+    name: "browser_watchdog_status",
+    description: "Read the current browser watchdog checks and last visible health result.",
+    inputSchema: { type: "object", properties: { name: { type: "string" } } },
+  },
+  {
+    name: "browser_watchdog_stop",
+    description: "Stop a named browser watchdog without changing the browser or bridge session.",
+    inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
+  },
+  {
+    name: "github_workspace_status",
+    description: "Inspect the current local Git/GitHub workspace: repository root, branch, upstream, remotes, ahead/behind counts, and changed files. This toolkit is read-only and never pulls, pushes, commits, or contacts GitHub.",
+    inputSchema: { type: "object", properties: { cwd: { type: "string", description: "Optional local workspace path. Defaults to the current Codex workspace." } } },
+  },
   {
     name: "bridge_discover",
     description: "Scan for visible Edge/Chrome browser instances, automatically start the dedicated persistent Edge profile when none is connectable, and present browsers, windows, and tabs in human terms. Technical IDs remain internal.",
@@ -2763,7 +3299,7 @@ const TOOLS = [
   },
   {
     name: "bridge_run",
-    description: "Run the active web connection as a bounded or continuous Brain-Hand relay using the current Codex conversation goal. The bridge supplies internal route/session IDs and stops on mismatch, blocker, repetition, evidence failure, or the configured safety limit.",
+    description: "Start the active web connection as a background bounded or continuous Brain-Hand relay using the current Codex conversation goal. The bridge supplies internal route/session IDs and stops on mismatch, blocker, repetition, evidence failure, or the configured safety limit. Use wait=true only when a caller explicitly needs the legacy synchronous result.",
     inputSchema: { type: "object", properties: {
       goal: { type: "string", description: "Internal compiled bridge goal created by bridge_goal_create; do not invent a separate UI goal." },
       context: { type: "string" },
@@ -2774,6 +3310,7 @@ const TOOLS = [
       executor_profile: executorProfileSchema(),
       timeout_ms: { type: "integer", default: 120000 },
       safety_limit: { type: "integer", minimum: 1, maximum: 10000, default: 1000 },
+      wait: { type: "boolean", default: false, description: "Wait for the whole run only when explicitly requested; the default is background execution so Codex remains usable." },
     } },
   },
   {
@@ -3171,6 +3708,14 @@ const ROUTED_TOOLS = new Set([
 ]);
 
 async function callToolDirect(name, args) {
+  if (name === "bridge_toolkit_list") return toolkitCatalog();
+  if (name === "bridge_toolkit_status") return toolkitStatus();
+  if (name === "bridge_link_list") return jsonResult("当前 Codex ↔ 网页端连接", { links: bridgeLinkList() });
+  if (name === "browser_watchdog_scan") return browserWatchdogScan(args);
+  if (name === "browser_watchdog_start") return browserWatchdogStart(args);
+  if (name === "browser_watchdog_status") return browserWatchdogStatus(args);
+  if (name === "browser_watchdog_stop") return browserWatchdogStop(args);
+  if (name === "github_workspace_status") return githubWorkspaceStatus(args);
   if (name === "bridge_discover") return bridgeDiscover(args);
   if (name === "bridge_connect") return bridgeConnect(args);
   if (name === "bridge_goal_create") return bridgeGoalCreate(args);
@@ -3257,7 +3802,11 @@ async function handle(message) {
   }
   if (message.method === "tools/call") {
     const params = message.params || {};
-    return { jsonrpc: "2.0", id: message.id, result: await callTool(params.name, params.arguments || {}) };
+    const hostContext = hostCodexContextFromRequest(message);
+    const argumentsWithContext = hostContext
+      ? { ...(params.arguments || {}), __host_codex_context: hostContext }
+      : (params.arguments || {});
+    return { jsonrpc: "2.0", id: message.id, result: await callTool(params.name, argumentsWithContext) };
   }
   return { jsonrpc: "2.0", id: message.id, error: { code: -32601, message: `Method not found: ${message.method}` } };
 }

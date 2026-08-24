@@ -17,12 +17,14 @@ const MAX_EVENTS = 80;
 const MAX_PENDING_EVENTS = 40;
 const ROUTE_LOCK_LEASE_MS = 120000;
 const ROUTE_LOCK_POLL_MS = 50;
+const WEB_DELIVERY_FILE = path.join(ROUTE_DIR, "web-deliveries.json");
 const routeQueues = new Map();
 let controlDb = null;
 
 export function controlPlaneCapabilities() {
   return {
     distributed_lock: Boolean(DatabaseSync),
+    durable_web_delivery_ledger: Boolean(DatabaseSync),
     serialization_scope: DatabaseSync ? "process-and-cross-process" : "process-only",
     note: DatabaseSync
       ? "SQLite route leases are active."
@@ -35,14 +37,149 @@ function getControlDb() {
   if (controlDb) return controlDb;
   fs.mkdirSync(path.dirname(CONTROL_PLANE_DB_PATH), { recursive: true });
   controlDb = new DatabaseSync(CONTROL_PLANE_DB_PATH);
+  // Multiple MCP processes can open the same control-plane database. Ask
+  // SQLite to wait briefly for the writer instead of failing immediately with
+  // SQLITE_BUSY during route-lease acquisition.
+  controlDb.exec("PRAGMA busy_timeout = 5000;");
   controlDb.exec(`
     CREATE TABLE IF NOT EXISTS route_locks (
       route_id TEXT PRIMARY KEY,
       owner TEXT NOT NULL,
       lease_until INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS web_deliveries (
+      delivery_id TEXT PRIMARY KEY,
+      route_id TEXT,
+      provider TEXT,
+      target_id TEXT,
+      conversation_url TEXT,
+      state TEXT NOT NULL,
+      prompt_length INTEGER NOT NULL DEFAULT 0,
+      original_prompt_length INTEGER NOT NULL DEFAULT 0,
+      error TEXT,
+      reply_length INTEGER,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
   return controlDb;
+}
+
+function parseDeliveryRow(row) {
+  if (!row) return null;
+  return {
+    delivery_id: String(row.delivery_id || ""),
+    route_id: row.route_id || null,
+    provider: row.provider || null,
+    target_id: row.target_id || null,
+    conversation_url: row.conversation_url || null,
+    state: String(row.state || "unknown"),
+    prompt_length: Number(row.prompt_length || 0),
+    original_prompt_length: Number(row.original_prompt_length || 0),
+    error: row.error || null,
+    reply_length: row.reply_length === null || row.reply_length === undefined ? null : Number(row.reply_length),
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null,
+  };
+}
+
+function readFallbackDeliveries() {
+  fs.mkdirSync(ROUTE_DIR, { recursive: true });
+  try {
+    const parsed = JSON.parse(fs.readFileSync(WEB_DELIVERY_FILE, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (error) {
+    if (error?.code === "ENOENT") return {};
+    return {};
+  }
+}
+
+function writeFallbackDeliveries(deliveries) {
+  fs.mkdirSync(ROUTE_DIR, { recursive: true });
+  fs.writeFileSync(WEB_DELIVERY_FILE, `${JSON.stringify(deliveries, null, 2)}\n`, "utf8");
+}
+
+export function readWebDelivery(deliveryId) {
+  const id = String(deliveryId || "").trim();
+  if (!id) return null;
+  const db = getControlDb();
+  if (db) return parseDeliveryRow(db.prepare("SELECT * FROM web_deliveries WHERE delivery_id = ?").get(id));
+  return readFallbackDeliveries()[id] || null;
+}
+
+export function writeWebDelivery(deliveryId, fields = {}) {
+  const id = String(deliveryId || "").trim();
+  if (!id) throw new Error("delivery_id is required");
+  const previous = readWebDelivery(id);
+  const timestamp = now();
+  const record = {
+    delivery_id: id,
+    route_id: fields.route_id ?? previous?.route_id ?? null,
+    provider: fields.provider ?? previous?.provider ?? null,
+    target_id: fields.target_id ?? previous?.target_id ?? null,
+    conversation_url: fields.conversation_url ?? previous?.conversation_url ?? null,
+    state: fields.state ?? previous?.state ?? "prepared",
+    prompt_length: Number(fields.prompt_length ?? previous?.prompt_length ?? 0),
+    original_prompt_length: Number(fields.original_prompt_length ?? previous?.original_prompt_length ?? 0),
+    error: fields.error ?? previous?.error ?? null,
+    reply_length: fields.reply_length ?? previous?.reply_length ?? null,
+    created_at: previous?.created_at || fields.created_at || timestamp,
+    updated_at: timestamp,
+  };
+  const db = getControlDb();
+  if (db) {
+    db.prepare(`
+      INSERT INTO web_deliveries (
+        delivery_id, route_id, provider, target_id, conversation_url, state,
+        prompt_length, original_prompt_length, error, reply_length, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(delivery_id) DO UPDATE SET
+        route_id = excluded.route_id,
+        provider = excluded.provider,
+        target_id = excluded.target_id,
+        conversation_url = excluded.conversation_url,
+        state = excluded.state,
+        prompt_length = excluded.prompt_length,
+        original_prompt_length = excluded.original_prompt_length,
+        error = excluded.error,
+        reply_length = excluded.reply_length,
+        created_at = excluded.created_at,
+        updated_at = excluded.updated_at
+    `).run(
+      record.delivery_id,
+      record.route_id,
+      record.provider,
+      record.target_id,
+      record.conversation_url,
+      record.state,
+      record.prompt_length,
+      record.original_prompt_length,
+      record.error,
+      record.reply_length,
+      record.created_at,
+      record.updated_at,
+    );
+    return record;
+  }
+  const deliveries = readFallbackDeliveries();
+  deliveries[id] = record;
+  writeFallbackDeliveries(deliveries);
+  return record;
+}
+
+export function removeWebDelivery(deliveryId) {
+  const id = String(deliveryId || "").trim();
+  if (!id) return false;
+  const db = getControlDb();
+  if (db) {
+    db.prepare("DELETE FROM web_deliveries WHERE delivery_id = ?").run(id);
+    return true;
+  }
+  const deliveries = readFallbackDeliveries();
+  const existed = Object.prototype.hasOwnProperty.call(deliveries, id);
+  delete deliveries[id];
+  if (existed) writeFallbackDeliveries(deliveries);
+  return existed;
 }
 
 function lockOwner(routeId) {
@@ -54,29 +191,42 @@ function tryAcquireDistributedLock(routeId, owner) {
   if (!db) return true;
   const nowMs = Date.now();
   const leaseUntil = nowMs + ROUTE_LOCK_LEASE_MS;
-  db.prepare(`
-    INSERT INTO route_locks (route_id, owner, lease_until)
-    VALUES (?, ?, ?)
-    ON CONFLICT(route_id) DO UPDATE SET
-      owner = excluded.owner,
-      lease_until = excluded.lease_until
-    WHERE route_locks.lease_until <= ? OR route_locks.owner = ?
-  `).run(routeId, owner, leaseUntil, nowMs, owner);
-  const row = db.prepare("SELECT owner FROM route_locks WHERE route_id = ?").get(routeId);
-  return row?.owner === owner;
+  try {
+    db.prepare(`
+      INSERT INTO route_locks (route_id, owner, lease_until)
+      VALUES (?, ?, ?)
+      ON CONFLICT(route_id) DO UPDATE SET
+        owner = excluded.owner,
+        lease_until = excluded.lease_until
+      WHERE route_locks.lease_until <= ? OR route_locks.owner = ?
+    `).run(routeId, owner, leaseUntil, nowMs, owner);
+    const row = db.prepare("SELECT owner FROM route_locks WHERE route_id = ?").get(routeId);
+    return row?.owner === owner;
+  } catch (error) {
+    if (error?.code === "ERR_SQLITE_ERROR" && /database is locked|busy/i.test(String(error))) return false;
+    throw error;
+  }
 }
 
 function renewDistributedLock(routeId, owner) {
   const db = getControlDb();
   if (!db) return;
-  db.prepare("UPDATE route_locks SET lease_until = ? WHERE route_id = ? AND owner = ?")
-    .run(Date.now() + ROUTE_LOCK_LEASE_MS, routeId, owner);
+  try {
+    db.prepare("UPDATE route_locks SET lease_until = ? WHERE route_id = ? AND owner = ?")
+      .run(Date.now() + ROUTE_LOCK_LEASE_MS, routeId, owner);
+  } catch (error) {
+    if (!/database is locked|busy/i.test(String(error))) throw error;
+  }
 }
 
 function releaseDistributedLock(routeId, owner) {
   const db = getControlDb();
   if (!db) return;
-  db.prepare("DELETE FROM route_locks WHERE route_id = ? AND owner = ?").run(routeId, owner);
+  try {
+    db.prepare("DELETE FROM route_locks WHERE route_id = ? AND owner = ?").run(routeId, owner);
+  } catch (error) {
+    if (!/database is locked|busy/i.test(String(error))) throw error;
+  }
 }
 
 async function withDistributedRouteLock(routeId, handler, { timeoutMs = 300000 } = {}) {
@@ -138,6 +288,7 @@ export function newRouteRecord(routeId, fields = {}) {
     executor_model: fields.executor_model || fields.executorModel || null,
     executor_profile: fields.executor_profile || fields.executorProfile || null,
     codex_thread_id: fields.codex_thread_id || fields.codexThreadId || null,
+    codex_binding: fields.codex_binding || fields.codexBinding || null,
     native_goal: fields.native_goal || fields.nativeGoal || null,
     session_id: fields.session_id || fields.sessionId || id,
     target_id: fields.target_id || fields.targetId || null,
@@ -221,6 +372,7 @@ export function routeSummary(route) {
     executor_model: route.executor_model || null,
     executor_profile: route.executor_profile || null,
     codex_thread_id: route.codex_thread_id || null,
+    codex_binding: route.codex_binding || null,
     native_goal: route.native_goal || null,
     session_id: route.session_id || null,
     target_id: route.target_id || null,

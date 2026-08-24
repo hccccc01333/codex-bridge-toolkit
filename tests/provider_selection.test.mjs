@@ -59,6 +59,16 @@ test("provider selection is exposed as an enum and persists on a session", async
   const server = startServer();
   try {
     const toolsResponse = await server.request("tools/list");
+    const toolkitListTool = toolsResponse.result.tools.find(tool => tool.name === "bridge_toolkit_list");
+    const toolkitStatusTool = toolsResponse.result.tools.find(tool => tool.name === "bridge_toolkit_status");
+    const linkListTool = toolsResponse.result.tools.find(tool => tool.name === "bridge_link_list");
+    const watchdogTool = toolsResponse.result.tools.find(tool => tool.name === "browser_watchdog_scan");
+    const githubTool = toolsResponse.result.tools.find(tool => tool.name === "github_workspace_status");
+    assert.ok(toolkitListTool);
+    assert.ok(toolkitStatusTool);
+    assert.ok(linkListTool);
+    assert.ok(watchdogTool);
+    assert.ok(githubTool);
     const sessionTool = toolsResponse.result.tools.find(tool => tool.name === "brain_browser_session_create");
     const planTool = toolsResponse.result.tools.find(tool => tool.name === "brain_plan");
     const routeTool = toolsResponse.result.tools.find(tool => tool.name === "bridge_route_create");
@@ -118,6 +128,34 @@ test("provider selection is exposed as an enum and persists on a session", async
     const panel = await server.request("tools/call", { name: "bridge_panel", arguments: {} });
     assert.equal(panel.result.structuredContent.native_ui, true);
     assert.equal(panel.result._meta.ui.resourceUri, "ui://codex-web-bridge/control-panel-v1.html");
+
+    const toolkitList = await server.request("tools/call", { name: "bridge_toolkit_list", arguments: {} });
+    assert.equal(toolkitList.result.structuredContent.series_version, "0.3.0");
+    assert.deepEqual(toolkitList.result.structuredContent.toolkits.map(toolkit => toolkit.id), ["web-bridge", "browser-watchdog", "github-workspace"]);
+
+    const toolkitStatus = await server.request("tools/call", { name: "bridge_toolkit_status", arguments: {} });
+    assert.ok(Array.isArray(toolkitStatus.result.structuredContent.links));
+
+    const linkList = await server.request("tools/call", { name: "bridge_link_list", arguments: {} });
+    assert.ok(Array.isArray(linkList.result.structuredContent.links));
+    assert.doesNotMatch(JSON.stringify(linkList.result.structuredContent), /route_id|session_id|target_id/);
+
+    const watchdogStart = await server.request("tools/call", {
+      name: "browser_watchdog_start",
+      arguments: { name: "test-watchdog", port: 1, timeout_ms: 500 },
+    });
+    assert.equal(watchdogStart.result.structuredContent.started, true);
+    assert.equal(watchdogStart.result.structuredContent.watchdog.lifecycle, "running");
+    assert.equal(watchdogStart.result.structuredContent.watchdog.state, "browser_unreachable");
+    const watchdogStop = await server.request("tools/call", {
+      name: "browser_watchdog_stop",
+      arguments: { name: "test-watchdog" },
+    });
+    assert.equal(watchdogStop.result.structuredContent.stopped, true);
+
+    const workspace = await server.request("tools/call", { name: "github_workspace_status", arguments: { cwd: repoRoot } });
+    assert.equal(workspace.result.structuredContent.ok, true);
+    assert.equal(workspace.result.structuredContent.read_only, true);
 
     const providerList = await server.request("tools/call", { name: "brain_provider_list", arguments: {} });
     assert.equal(providerList.result.structuredContent.default_provider, "chatgpt");

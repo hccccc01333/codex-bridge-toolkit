@@ -1,15 +1,15 @@
 {
   "name": "chatgpt-web-bridge",
-  "version": "0.2.0+codex.20260821051423",
-  "description": "A user-facing Codex to Web LLM conversation bridge with visible browser discovery, ChatGPT/DeepSeek adapters, safe relay modes, and local Codex execution.",
+  "version": "0.3.0+codex.20260824095316",
+  "description": "A local-first Codex toolkit series: visible Web LLM bridge, browser watchdog, multi-link status, and read-only GitHub workspace diagnostics.",
   "author": {
     "name": "Local developer"
   },
   "skills": "./skills/",
   "interface": {
-    "displayName": "Codex \u2194 Web LLM Bridge",
-    "shortDescription": "Connect the current Codex task to a visible web AI.",
-    "longDescription": "Codex \u2194 Web LLM Conversation Bridge connects the current Codex task to ChatGPT Web, DeepSeek Web, and future web-LLM adapters without exposing browser ports or routing IDs. It discovers visible browser instances, presents windows/tabs/conversations by human-readable names, supports one-shot, manual link, bounded relay, and continuous goal modes, verifies the destination before every send, and provides a two-column conversation UI in hosts that support UI resources. It never reads passwords, cookies, API keys, private endpoints, or hidden chain-of-thought.",
+    "displayName": "Codex Bridge Toolkit Series",
+    "shortDescription": "Connect Codex to web AIs and inspect browser/GitHub workspaces safely.",
+    "longDescription": "Codex Bridge Toolkit Series contains the visible Web LLM Conversation Bridge, a read-only Edge/Chrome browser watchdog, human-readable multi-link status, and a read-only GitHub workspace toolkit. The bridge connects Codex tasks to ChatGPT Web or DeepSeek Web without exposing browser ports or routing IDs, verifies the destination before every send, and supports one-shot, manual link, bounded relay, and continuous goal modes. The watchdog never switches tabs or resends messages. The GitHub toolkit never pulls, pushes, commits, or contacts GitHub automatically. No passwords, cookies, API keys, private endpoints, or hidden chain-of-thought are collected.",
     "developerName": "Codex Luna Bridge contributors",
     "category": "Productivity",
     "capabilities": [
@@ -19,10 +19,10 @@
     ],
     "brandColor": "#10A37F",
     "defaultPrompt": [
+      "List the Codex Bridge toolkit series.",
       "Open the two-column web bridge panel inside this Codex conversation.",
       "Connect this Codex conversation to a visible web AI.",
-      "Ask the connected web model one question or relay the current Codex task.",
-      "Use Brain-Hand mode when the web model should plan/review and Codex should execute the current conversation goal locally."
+      "Check the browser watchdog or current GitHub workspace safely."
     ]
   },
   "mcpServers": "./.mcp.json"
