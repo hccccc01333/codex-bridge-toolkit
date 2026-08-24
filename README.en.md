@@ -1,503 +1,321 @@
 # 🧰 Codex Bridge Toolkit Series
 
-> Talk only in Codex. The toolkit series connects visible web LLMs, monitors browser health, and reads local GitHub workspace context safely.
+> Let a web LLM plan and review while Codex or OpenCode executes in the local workspace—with visible browser automation and local MCP only.
 
-**Language: [中文（默认）](README.md) · English**
+**Default language: [中文（默认）](README.md) · English**
 
-**GitHub:** [hccccc01333/codex-bridge-toolkit](https://github.com/hccccc01333/codex-bridge-toolkit)
+**Repository:** [hccccc01333/codex-bridge-toolkit](https://github.com/hccccc01333/codex-bridge-toolkit)
 
 ![Node.js](https://img.shields.io/badge/Node.js-ESM-339933?logo=node.js&logoColor=white)
-![MCP](https://img.shields.io/badge/MCP-enabled-6f42c1)
+![MCP](https://img.shields.io/badge/MCP-stdio-6f42c1)
 ![Browser](https://img.shields.io/badge/Chrome%20%2F%20Edge-visible%20CDP-4285F4?logo=googlechrome&logoColor=white)
 ![Local-first](https://img.shields.io/badge/local--first-10b981)
-![Multi-browser](https://img.shields.io/badge/multi--browser%20%2F%20tab%20routing-f59e0b)
+![Version](https://img.shields.io/badge/version-0.8.0-2563eb)
 
-Codex ↔ Web LLM Conversation Bridge connects a Codex conversation to a visible ChatGPT Web, DeepSeek Web, or another supported web LLM. Users choose the provider, browser, window, tab, web conversation, and relay mode in natural language. The bridge handles browser discovery, routing, message envelopes, destination verification, and stop policies internally.
+## In one sentence
 
-```text
-ChatGPT Web / DeepSeek Web          Web brain
-              │ visible reply
-              ▼
-     Codex ↔ Web LLM Bridge
-              │ safe relay
-              ▼
-Codex / DeepSeek API                Local executor
-              │
-              ▼
-       Workspace + tests + evidence
-              └──────────────► Web brain
-```
-
-The bridge does not use the ChatGPT API, private web endpoints, cookie extraction, or password collection. The browser remains visible and the user completes login manually.
-
-## Toolkit series
-
-This repository is now an extensible local-first toolkit series, installed as one Codex plugin:
-
-| Toolkit | Purpose |
-| --- | --- |
-| Web LLM Conversation Bridge | Connect ChatGPT/DeepSeek Web so the web brain plans/reviews and Codex executes locally |
-| Browser Watchdog | Read-only checks for login, loading, generation, composer failure, or an unresponsive web session |
-| GitHub Workspace | Read-only local Git/GitHub repository context for execution and review |
-
-Useful natural-language requests include:
+This is a “web brain ↔ local executor” bridge toolkit:
 
 ```text
-List the toolkits in this plugin.
-Show all Codex ↔ web links.
-Check whether the ChatGPT tab is stuck.
-Inspect the current GitHub workspace.
+ChatGPT Web / DeepSeek Web
+          │ planning, questions, review
+          ▼
+       Bridge Control Plane
+          │                 │
+          ▼                 ▼
+     Codex Worker       OpenCode Worker
+          │                 │
+          └────────┬────────┘
+                   ▼
+        local workspace, tests, evidence
 ```
 
-Each Codex conversation and web conversation can have an independent persisted link. Users see names, providers, web conversation titles, and status; `session_id`, `targetId`, and `route_id` stay internal. See [Toolkit series](docs/toolkit-series.md).
+Users talk only in the current host conversation. The toolkit discovers visible browser connections, binds a web conversation, relays explicit messages, persists link state, watches browser health, and pauses when the destination is uncertain.
 
-### Choose by intent
+> This is not the ChatGPT API, a cookie scraper, or a password collector. The browser remains visible and the user signs in manually.
 
-| Goal | Say this in Codex | Default side effect |
+## Choose your local host
+
+| Local host | Best bridge path | Key point |
 | --- | --- | --- |
-| Let a web model plan/review a local task | `Connect to ChatGPT Web.` | Sends only after the bridge workflow is confirmed |
-| Check whether a web session is stuck | `Check whether the ChatGPT tab is stuck.` | Read-only; no tab switch or resend |
-| Monitor one web session periodically | `Start a browser watchdog named “paper ChatGPT” every 15 seconds.` | Monitors only the current MCP process |
-| Inspect the current GitHub repository | `Inspect the current GitHub workspace.` | Read-only; no pull/push/commit |
+| Codex Desktop / CLI | ChatGPT Web or DeepSeek Web ↔ Codex | Uses a Codex App Server worker and can synchronize the toolkit-managed native Goal |
+| OpenCode | ChatGPT Web or DeepSeek Web ↔ OpenCode | OpenCode can load this plugin as local stdio MCP; start `opencode serve` only for toolkit-managed execution |
+| Other MCP host | Web model ↔ current host | Standard stdio MCP is supported; dedicated execution capability is reported per host |
 
-Watchdogs must be started again after the MCP process restarts. They never pretend to have resumed and never silently continue a web session in the background.
+Codex and OpenCode are parallel hosts. They do not share hidden host sessions, and OpenCode is not disguised as Codex. Web adapters, browser verification, the Control Plane, watchdogs, and stop policies are shared; executor host adapters are separate.
 
-## First use after installation
+## Start in five minutes
 
-If you only want to connect Codex to ChatGPT Web or DeepSeek Web, follow these steps. Normal users do not need to understand `session_id`, `targetId`, `route_id`, MCP servers, or DevTools internals.
+### 1. Install
 
-### 1. Install the plugin and create a new Codex conversation
+Install the plugin from the Codex plugin marketplace, restart Codex, and create a new conversation.
 
-Install `chatgpt-web-bridge` from the Codex plugin marketplace. After installing or updating:
-
-1. Restart Codex.
-2. Create a new Codex conversation.
-3. Use the bridge from that new conversation.
-
-Creating a new conversation matters because Codex may cache old plugin tools and skills. An existing conversation may not pick up the updated bridge immediately.
-
-### 2. Prepare Edge automatically on the first connection
-
-A normally launched Edge process cannot be taken over after the fact. Normal users do not need to manage a remote-debugging port or open PowerShell.
-
-When you say “Connect to ChatGPT Web” or “Connect to DeepSeek Web” in Codex, the bridge automatically:
-
-1. scans browsers that are already connectable;
-2. starts an independent `CodexBridgeEdge` profile if none is available;
-3. opens the selected ChatGPT or DeepSeek web page;
-4. asks you to sign in manually in the visible window the first time;
-5. reuses that window and login on later connections.
-
-The dedicated Edge profile does not affect the Edge window you already use. Keep it open because the bridge can connect only to a running browser instance that exposes a debugging connection. Advanced users can set `auto_launch: false` and manage the browser themselves.
-
-### 3. Open the bridge in Codex
-
-In the new Codex conversation, say:
-
-```text
-Open the web bridge panel.
-```
-
-If your Codex version does not render the embedded panel, say:
-
-```text
-Open the web bridge panel in compatibility mode.
-```
-
-You can also skip the panel and say:
-
-```text
-Connect to ChatGPT Web.
-```
-
-The bridge scans available browsers and asks you to choose the web provider, browser, window, tab, and web conversation. Choose the visible name or number shown by Codex. Do not enter technical IDs.
-
-### 4. Log in or recover a connection
-
-If Codex reports that login is required:
-
-1. Complete login manually in the dedicated Edge window.
-2. Return to the same Codex conversation and say:
-
-```text
-I am logged in. Continue.
-```
-
-The bridge checks the login state, provider, tab, conversation, and composer again. It does not keep an MCP request open while waiting and never reads passwords, cookies, or tokens.
-
-Once connected, the bridge pins the session to the same browser tab. Ordinary retries, health checks, or a temporary selector failure never create another tab; a new tab is allowed only for the initial connection or an explicit reconnection after the bound target is actually closed.
-
-### 5. Choose a relay mode
-
-After the connection becomes healthy, the plugin asks in the Codex conversation:
-
-```text
-What do you want Codex to accomplish? Describe one concrete goal.
-```
-
-After you answer, the plugin compiles the answer into a goal and attaches it to the current bridge task. The panel does not ask questions or create goals. The modes only choose how that goal collaborates with the web model:
-
-| Goal | Say this in Codex |
-| --- | --- |
-| Ask the web model once | `Ask ChatGPT this question and return its opinion.` |
-| Connect without sending | `Connect to DeepSeek Web, but do not send a message yet.` |
-| Run a bounded task | `Use ChatGPT for planning and review for up to 10 rounds.` |
-| Keep working until stopped | `Continue this goal until it is complete or blocked.` |
-
-Example Brain-Hand workflow:
-
-```text
-Fix all failing tests in the current project and preserve test evidence.
-Use ChatGPT Web for planning and review, Codex for execution, for up to 10 rounds.
-```
-
-The plugin uses the first sentence as the user's answer, creates the bridge goal, and attaches it to the task. The panel never asks you to enter a duplicate goal.
-
-### 6. What you should see
-
-After connecting, the two sides are shown separately:
-
-```text
-┌─────────────────────┐   ··· ↔ ···   ┌─────────────────────┐
-│ Current Codex task  │  ──●──────▶  │ ChatGPT / DeepSeek  │
-│ Current goal        │  ◀──●──────  │ Web reply           │
-└─────────────────────┘               └─────────────────────┘
-```
-
-The left side is the current Codex task and the right side is the selected web conversation. The dashed line represents the binding; the connection marker represents the current connection state. If the web provider, tab, conversation, or login state changes, the bridge pauses instead of sending to an uncertain destination.
-
-## Why use it?
-
-| Without the bridge | With the bridge |
-| --- | --- |
-| A web model can plan but cannot safely operate on the local workspace. | The web model plans and reviews while Codex executes locally. |
-| Codex executes locally, but every planning and review turn consumes the executor's context. | Planning, execution, evidence, and review form a controlled loop. |
-| Multiple browser conversations are easy to mix up. | The bridge shows browser, window, tab, and conversation names and verifies the destination before every send. |
-
-The core idea is:
-
-> **Brain = the visible web LLM selected by the user**
->
-> **Executor = the Codex App Server worker**
-
-The default combination is ChatGPT Web → ChatGPT Luna. You can also choose DeepSeek Web, DeepSeek API Pro/Flash, or the current local Codex provider configuration. Technical route and session identifiers remain internal.
-
-## How it works
-
-```text
-1. The plugin creates a goal from the user's answer after connection.
-2. The web brain proposes one concrete next task.
-3. Codex executes it in the connected workspace.
-4. The bridge sends changes, tests, blockers, and evidence back to the web brain.
-5. The web brain reviews the execution result.
-6. The loop continues, completes, blocks, or stops after repetition.
-```
-
-### Five-minute quick start
-
-After installing the plugin, create a new Codex conversation and say:
-
-```text
-Connect to ChatGPT Web.
-```
-
-The bridge scans connectable browsers and shows readable choices such as:
-
-```text
-Found 2 connectable browsers:
-
-① Edge browser 1 · 2 windows · 8 tabs
-② Edge browser 2 · 1 window · 3 tabs
-```
-
-Choose the tab and web conversation by name or position. For a one-time question:
-
-```text
-Ask ChatGPT to review the current architecture and point out disagreements.
-```
-
-For a Brain-Hand loop:
-
-```text
-Connect to ChatGPT and use 10 relay rounds.
-Goal: fix all failing tests in the current project until the web reviewer approves.
-```
-
-The bridge handles browser selection, conversation binding, planning, execution, reporting, review, evidence checks, and safe stopping. Users do not need to enter `session_id`, `target_id`, `route_id`, or a DevTools port.
-
-## How the control panel works
-
-The plugin includes a status-only two-column panel for hosts that support MCP UI resources. It is a compatible rendering of the intended Codex ↔ Web layout; it is not an undocumented injection into the official Codex Desktop renderer.
-
-Say:
-
-```text
-Open the web bridge panel.
-```
-
-The `bridge_panel` tool renders the panel inside the current Codex conversation when the host supports UI resources. The host conversation is the binding boundary: a panel rendered in Codex conversation A belongs to A, and a panel rendered in conversation B belongs to B. Codex is shown on the left and the selected web conversation on the right, joined by a dashed link and a connection marker.
-
-When the MCP host provides the current Codex conversation context in request metadata, the bridge binds that visible conversation to the route and shows `Current Codex conversation`. When the host does not provide it, the bridge explicitly shows `Plugin-managed Codex Worker` instead of guessing a thread ID. The panel only visualizes connection state and destination; messages, questions, goals, and controls remain in the Codex conversation.
-
-### Native Codex Goal synchronization
-
-After the web connection is ready, Codex asks the user for the task objective. `bridge_goal_create` persists the Bridge Goal; in bounded or continuous mode it also creates or resumes the internal Codex Worker and writes the native Goal through the official App Server `thread/goal/set` method. The result includes `native_goal.synced`; only `true` means the native Goal was written successfully.
-
-“Native Goal” normally means the Goal on the Codex Worker thread managed by the plugin. If the MCP host provides and the bridge verifies the current visible Codex thread, the route resumes and binds that conversation instead. Without host context, the plugin does not guess or mutate another Desktop task. One-shot mode does not start a Worker just to send one message; `bridge_run` retries synchronization when it starts the Worker later. See [the native integration boundary](docs/codex-native-integration.md).
-
-If the host does not render MCP UI resources, use compatibility mode. It opens the legacy loopback panel on `127.0.0.1` with a random per-launch token. A truly native Desktop panel requires a Codex host extension point or a maintained Codex fork; see [the native integration boundary](docs/codex-native-integration.md).
-
-## Connection modes
-
-| Mode | User wording | Behavior |
-| --- | --- | --- |
-| One-shot | “Ask ChatGPT” | Send once, receive the visible reply, then stop |
-| Manual link | “Connect, but do not send automatically” | Establish a link and wait for the next instruction |
-| Bounded rounds | “Use 10 rounds” | Run 1–50 controlled relay rounds |
-| Continuous | “Continue the current Codex goal” | Continue until completion, blocking, repetition, goal change, or user stop |
-
-`0` rounds means a manual link, not an infinite loop. The plugin creates the goal by asking the user after connection; the relay mode only chooses how that goal collaborates with the web model. Bounded and continuous modes apply internal safety limits.
-
-## Browser → window → tab → conversation
-
-One browser instance can host multiple windows and tabs. The bridge presents this hierarchy in human terms and keeps technical target identities private:
-
-```text
-Edge browser 1
-├── Window 1
-│   ├── ① GitHub
-│   ├── ② ChatGPT
-│   └── ③ DeepSeek
-└── Window 2
-    └── ① ChatGPT
-```
-
-A web tab and a conversation are separate bindings: a user can switch conversations inside the same ChatGPT tab. Before every send, the bridge verifies the provider domain, browser tab, and conversation fingerprint. If the user switches to another conversation, the connection pauses instead of sending to the wrong destination.
-
-## Brain/executor combinations
-
-The web brain and Codex executor are independent choices:
-
-| Web brain | Codex executor | Use case |
-| --- | --- | --- |
-| ChatGPT Web | ChatGPT Luna | Default, general-purpose planning and execution |
-| DeepSeek Web | ChatGPT Luna | Chinese planning with the Luna executor |
-| ChatGPT Web | DeepSeek API Pro | Stronger DeepSeek execution/reasoning |
-| ChatGPT Web | DeepSeek API Flash | Lower-cost, lower-latency execution |
-| DeepSeek Web | DeepSeek API Pro/Flash | DeepSeek planning and execution |
-| ChatGPT/DeepSeek Web | `codex_current` | Follow the user's existing local Codex provider/model |
-
-Use `executor_provider_list` to inspect available executor choices. DeepSeek documents its OpenAI-compatible API and Pro/Flash model names in the [official API documentation](https://api-docs.deepseek.com/api/list-models).
-
-## Brain-Hand loop
-
-```mermaid
-stateDiagram-v2
-    [*] --> Plan
-    Plan --> Execute: brain_plan
-    Execute --> Report: executor_report
-    Report --> Review: brain_review
-    Review --> Plan: continue
-    Review --> Completed: completed + evidence
-    Review --> Blocked: blocked or missing evidence
-    Review --> Repeated: repeated
-    Review --> MaxRounds: max_rounds
-    Completed --> [*]
-    Blocked --> [*]
-    Repeated --> [*]
-    MaxRounds --> [*]
-```
-
-`continue_task` and the runtime runner enforce:
-
-- 20 default rounds and 50 maximum for bounded runs
-- an evidence gate before completion
-- repeated-result detection
-- blocked-state detection
-- an explicit stop on Codex approval or interaction requests
-
-## Control Plane and adapters
-
-```mermaid
-flowchart TB
-    CP[Control Plane]
-    CP --> R[Internal link]
-    R --> B[Web brain adapter]
-    R --> E[Codex executor adapter]
-    R --> S[Browser / window / tab]
-    S --> T[Conversation fingerprint]
-```
-
-The Control Plane stores routing metadata and recent structured events, not a centralized transcript warehouse. ChatGPT Web and DeepSeek Web are separate provider adapters. The user-facing layer uses names and positions; internal route/session identifiers are implementation details. Actions for one link are serialized while separate links can progress independently.
-
-## Security model
-
-### Included
-
-- Visible Chrome or Edge automation
-- Manual user login
-- Localhost Chrome DevTools Protocol
-- A dedicated browser profile recommendation
-- Human-readable browser/window/tab/conversation selection
-- Destination verification before every send
-- Message origin, relay, and deduplication metadata
-- Bounded reports instead of hidden reasoning
-
-### Not included
-
-- Password collection
-- Cookie or session-token extraction
-- CAPTCHA or access-control bypass
-- Private ChatGPT endpoints
-- Hidden conversation-history scraping
-- Hidden chain-of-thought extraction
-- Silent approval of Codex commands
-
-## What this is not
-
-This project is not:
-
-- a ChatGPT API wrapper
-- a reverse-engineered private API client
-- a cookie/session-token scraper
-- an unrestricted autonomous computer agent
-- a centralized conversation-history server
-
-## Troubleshooting
-
-### Edge is not found
-
-The usual cause is that the current Edge was launched normally and does not expose a debugging connection. Normal users do not need to repair this manually; say the following in the same Codex conversation:
-
-```text
-Start the dedicated browser and open ChatGPT Web.
-```
-
-The bridge starts and scans the dedicated `CodexBridgeEdge` profile automatically. Sign in in the new visible window the first time, and keep it separate from your ordinary Edge window.
-
-### Multiple browsers or tabs are listed
-
-This is expected. The bridge does not guess a destination. Choose the browser name, window number, and tab title returned by Codex.
-
-### The web page is logged in, but the bridge asks for login
-
-Make sure you logged in to the dedicated Edge profile that the bridge discovered, not another ordinary Edge window. After logging in, return to the same Codex conversation and say:
-
-```text
-I am logged in. Continue.
-```
-
-If the composer or send button is temporarily unavailable, the bridge reloads the original tab once and checks it again. It continues if recovery succeeds; otherwise it preserves the tab and pauses instead of reopening the page. Reconnect explicitly only after confirming that the target was actually closed.
-
-### The panel does not appear
-
-Create a new Codex conversation and ask for the panel again. If it still does not appear, use compatibility mode. Compatibility mode opens a local loopback panel and does not replace manual web login.
-
-### Codex does not use the updated plugin
-
-Restart Codex after installation or update, then test in a new conversation. The recommended first command is:
-
-```text
-Open the web bridge panel.
-```
-
-If your Codex version supports plugin mentions, you can be explicit:
-
-```text
-@chatgpt-web-bridge Open the web bridge panel.
-```
-
-### The web model or conversation is wrong
-
-Say:
-
-```text
-Pause the web connection.
-```
-
-The bridge automatically pauses when the browser, tab, provider, conversation, or login state changes. Correct the visible browser page, then explicitly ask to resume. It will not guess a new conversation.
-
-### Why do I see `dashi-taskboard`?
-
-`dashi-taskboard` is not a dependency of this plugin and is not bundled into this repository. It is a separate public project. If your ordinary Edge window already has that GitHub page open, browser discovery can see the tab or window. Before sending anything, the bridge still verifies the web-model domain and conversation destination, so it will not treat a GitHub page as a ChatGPT or DeepSeek conversation. Choose the correct web-LLM tab.
-
-## Tool reference
-
-Most users only need natural-language requests in the Codex conversation.
-
-### Toolkit series tools
-
-- `bridge_toolkit_list`
-- `bridge_toolkit_status`
-- `bridge_link_list`
-- `browser_watchdog_scan`
-- `browser_watchdog_start`
-- `browser_watchdog_status`
-- `browser_watchdog_stop`
-- `github_workspace_status`
-
-### End-user bridge tools
-
-- `bridge_panel`
-- `bridge_discover`
-- `bridge_connect`
-- `bridge_goal_create`
-- `bridge_status`
-- `bridge_focus`
-- `bridge_send`
-- `bridge_receive`
-- `bridge_run`
-- `bridge_pause`
-- `bridge_disconnect`
-
-### Brain-Hand tools
-
-- `brain_plan`
-- `executor_report`
-- `brain_review`
-- `continue_task`
-- `run_round`
-- `run_until_stop`
-- `brain_status`
-- `brain_reset`
-
-### Control Plane and Codex worker tools
-
-- `bridge_route_create`
-- `bridge_route_bind`
-- `bridge_route_list`
-- `bridge_route_status`
-- `bridge_route_pause`
-- `bridge_route_resume`
-- `bridge_route_event`
-- `executor_provider_list`
-- `codex_adapter_status`
-- `codex_thread_start`
-- `codex_thread_turn`
-- `codex_thread_read`
-
-Lower-level browser tools remain available for diagnostics and adapter development, but they are not part of the normal user workflow. The public bridge resolves human browser names, window labels, tab positions/titles, and conversation titles into internal identities.
-
-## Limitations
-
-- Requires a visible, manually signed-in web-brain session.
-- A normal browser process without a debugging connection cannot be attached after the fact.
-- Depends on the current visible ChatGPT Web or DeepSeek Web UI and its selectors.
-- Does not bypass login, CAPTCHA, rate limits, or access controls.
-- Windows cannot attach the bridge to an arbitrary existing desktop Codex window. `codex_current` inherits the user's local Codex configuration; worker identity remains internal unless a developer uses the low-level adapter API.
-- The Control Plane stores routing metadata and recent structured events, not a full transcript warehouse.
-- Cross-process route locking depends on Node's `node:sqlite` capability.
-- A Codex approval or interaction request stops the loop instead of being auto-approved.
-
-## Development
-
-Normal users do not need these commands. Contributors working from a clone can run:
+For repository development:
 
 ```powershell
+git clone https://github.com/hccccc01333/codex-bridge-toolkit.git
+cd codex-bridge-toolkit
 npm test
 npm run check
 ```
 
-The plugin manifest is `.codex-plugin/plugin.json`, the MCP server definition is `.mcp.json`, and the MCP entrypoint is `scripts/mcp_server.mjs`.
+End users do not need to start `scripts/mcp_server.mjs` manually or enter `session_id`, `targetId`, `route_id`, or a DevTools port.
 
-For a privacy-safe demo recording, use the [demo recording script](docs/demo-script.md). The repository does not include placeholder GIFs or recordings containing login accounts.
+### 2. Connect a web model
+
+In the new Codex conversation, say:
+
+```text
+Connect to ChatGPT Web.
+```
+
+Or:
+
+```text
+Connect to DeepSeek Web.
+```
+
+The bridge scans debuggable browsers and presents the hierarchy browser → window → tab → web conversation in human-readable terms. If no debuggable browser is available, it starts a dedicated persistent Edge profile named `CodexBridgeEdge` and opens the provider page.
+
+### 3. Sign in once
+
+Sign in manually in the visible Edge window, then return to the same Codex conversation and say:
+
+```text
+I am logged in. Continue.
+```
+
+The toolkit never collects passwords, cookies, tokens, or CAPTCHAs. The dedicated profile is reused for later links.
+
+### 4. Let the toolkit create the goal
+
+After the connection is healthy, the toolkit asks in the current host conversation:
+
+```text
+What do you want to accomplish?
+```
+
+Answer with one concrete goal:
+
+```text
+Fix all failing tests in the current project and report changes, tests, and evidence after every round.
+```
+
+The answer becomes a Bridge Goal. For bounded or continuous Brain-Hand runs, the Codex adapter also attempts to synchronize the goal to the managed Codex Worker native Goal; only `native_goal.synced: true` means that synchronization succeeded. The panel only visualizes status—it does not ask questions or create goals.
+
+### 5. Choose a relay mode
+
+```text
+One-shot: ask ChatGPT this architecture question and return its opinion.
+Manual link: connect to DeepSeek, but do not send automatically.
+Bounded: use ChatGPT for planning and review for up to 10 rounds.
+Continuous: continue the current goal until complete, blocked, or stopped.
+```
+
+| Mode | Meaning |
+| --- | --- |
+| One-shot | Send once and return the visible web reply |
+| Manual link | `0` rounds: connect without automatic sending |
+| Bounded rounds | Run 1–50 controlled rounds; the default bounded limit is 20 |
+| Continuous | Continue the current goal until completion, blocking, repetition, destination change, timeout, or user stop |
+
+## OpenCode setup
+
+OpenCode has two integration levels.
+
+### A. OpenCode calls the local MCP: simplest path
+
+Merge this into OpenCode's `opencode.jsonc` and replace both absolute paths:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "codex-bridge": {
+        "type": "local",
+        "command": [
+          "node",
+          "C:/path/to/codex-bridge-toolkit/scripts/mcp_server.mjs"
+        ],
+        "cwd": "C:/path/to/your/project",
+        "environment": {
+          "CODEX_BRIDGE_EXECUTOR_PROVIDER": "opencode",
+          "OPENCODE_SERVER_URL": "http://127.0.0.1:4096"
+        }
+      }
+    }
+  }
+}
+```
+
+Restart OpenCode and say:
+
+```text
+Connect to ChatGPT Web using the current workspace. Establish the link, but do not start a multi-round run.
+```
+
+In this mode OpenCode itself calls MCP tools and executes the local task. You do not need `opencode serve`.
+
+### B. Toolkit-managed OpenCode worker: automatic Brain-Hand
+
+To let the Control Plane create and drive an independent OpenCode execution session, start the local OpenCode server from the project workspace:
+
+```powershell
+opencode serve --hostname 127.0.0.1 --port 4096
+```
+
+Then select:
+
+```json
+{
+  "executor_provider": "opencode",
+  "executor_endpoint": "http://127.0.0.1:4096",
+  "executor_model": "provider/model",
+  "executor_agent": "build"
+}
+```
+
+Fill `executor_model` and `executor_agent` according to your OpenCode configuration; omit them when not needed. OpenCode is not presented as Codex, and it has no Codex native Goal API, so this flow uses the toolkit's local Bridge Goal.
+
+See [examples/opencode/](examples/opencode/) for a copyable template. Use OpenCode's [official MCP documentation](https://opencode.ai/v2/docs/mcp-servers) and [official Server API documentation](https://dev.opencode.ai/docs/server/) for its host-side configuration.
+
+## Implemented capability
+
+| Capability | Status | Boundary |
+| --- | --- | --- |
+| Parallel Codex / Pro web sessions | ✅ | Separate host contexts get isolated workers; one route remains serialized |
+| ChatGPT Web / DeepSeek Web | ✅ | Visible Chrome/Edge DOM/CDP; no private web endpoint |
+| Parallel Codex / OpenCode hosts | ✅ | Codex App Server; OpenCode local MCP or explicit local server |
+| Browser Watchdog | ✅ | Login, composer, send button, generation timeout, disconnect, and selector degradation |
+| Goal and evidence loop | ✅ | plan → execute → report → review; completion requires evidence |
+| Multi-web-session Swarm | ✅ experimental | Independent worker, target, and watchdog per member; group pauses on failure |
+| Local GitHub workspace | ✅ read-only | Captures repository, branch, HEAD, and change-count summaries; no automatic pull/push/commit |
+| Local artifact tools | 🟡 | Discovers Word/PPT/PDF metadata; reads explicitly selected Markdown/text/CSV only |
+| Notion / Word / PPT body collaboration | ⏳ | Body adapters are not included in this release |
+| Computer Use semantic checks | ⏳ | Current Watchdog is rule-based CDP/DOM observation, not a vision model |
+| Dedicated DevSpace adapter | ⏳ | Generic stdio MCP compatibility is reported, but no dedicated adapter is claimed |
+
+Semantic “model degradation” is not reliably inferable from browser rules. The current implementation reports observable hangs, timeouts, disconnects, and UI degradation; uncertainty causes a pause rather than a guess.
+
+## Multiple sessions and fail-closed behavior
+
+A browser tab is not a fixed web conversation. A user can switch conversations inside the same ChatGPT or DeepSeek tab, so every send re-verifies:
+
+- browser instance, window, and original tab;
+- provider domain;
+- conversation URL/title fingerprint;
+- login state, composer, and send control;
+- whether the previous message was already consumed.
+
+If the tab closes, the conversation changes, the provider is wrong, generation times out, a duplicate is detected, or parsing fails, the link enters `PAUSED`. The bridge allows one refresh of the original tab; if recovery fails, it preserves the target and stops. It never silently switches tabs, creates a replacement conversation, or resends an uncertain prompt.
+
+A web-session Swarm shares one compact local Git workspace summary, but each member owns an independent worker, browser target, and watchdog. One member failure pauses the group until the original target is repaired and the user explicitly resumes it.
+
+## The status panel
+
+```text
+┌────────────────────┐   ··· ↔ ···   ┌────────────────────┐
+│ Current Codex task  │  ──●──────▶  │ ChatGPT / DeepSeek  │
+│ Goal / status       │  ◀──●──────  │ Web chat / status    │
+└────────────────────┘               └────────────────────┘
+```
+
+`bridge_panel` is a status visualization: Codex or the managed worker on the left, the selected provider/browser/tab/conversation on the right, and a dashed link between them. It does not show message bodies, ask questions, create goals, or pretend to be an undocumented native Codex Desktop injection.
+
+Hosts with MCP UI resources can render it in the current conversation. Other hosts can use the compatibility loopback panel. An official native toolbar/panel extension point is not assumed by this repository.
+
+## Toolkit map
+
+| Toolkit | Useful entry points |
+| --- | --- |
+| Web LLM Bridge | `bridge_discover`, `bridge_connect`, `bridge_send`, `bridge_run` |
+| Browser Watchdog | `browser_watchdog_scan`, `browser_watchdog_start` |
+| GitHub Workspace | `github_workspace_status`, `github_workspace_bind` |
+| Host Compatibility | `bridge_host_status` |
+| Artifact Workspace | `artifact_workspace_status`, `artifact_workspace_read` |
+| Web Session Swarm | `bridge_swarm_create`, `bridge_swarm_status`, `bridge_swarm_run` |
+| Brain-Hand loop | `brain_plan`, `executor_report`, `brain_review`, `continue_task` |
+| OpenCode executor | `executor_provider_list`, `codex_adapter_status`, `codex_thread_start` |
+
+Most users only need natural-language requests in the current host conversation:
+
+```text
+Show all web links
+Check whether the ChatGPT tab is stuck
+Scan this workspace for Word, PPT, and PDF assets
+Create three web sessions bound to this workspace
+```
+
+## Safety boundary
+
+Included:
+
+- visible Chrome/Edge automation and localhost CDP;
+- manual user sign-in;
+- destination verification, origin labels, deduplication, and evidence gates;
+- persisted cross-process route state and recent structured events;
+- fail-closed stop policies.
+
+Not included:
+
+- password, cookie, token, API-key, or CAPTCHA collection;
+- private ChatGPT endpoints, hidden history, or hidden chain-of-thought;
+- auto-approved commands, silent tab replacement, or replacement conversations;
+- automatic pull, push, commit, or GitHub writes;
+- treating a web-model reply as user authorization.
+
+## Repository map
+
+```text
+.codex-plugin/              plugin manifest
+.mcp.json                   local stdio MCP entry
+scripts/mcp_server.mjs      MCP server and compatibility routing
+src/adapters/               ChatGPT/DeepSeek/Codex/OpenCode adapters
+src/control_plane/          routes, leases, and cross-process workers
+src/toolkits/               Watchdog, GitHub, artifact, and host toolkits
+src/orchestration/          Swarm state and stop policies
+examples/opencode/           OpenCode configuration template
+tests/                       protocol, route, adapter, and pressure tests
+```
+
+## Troubleshooting
+
+### No browser or login required
+
+A normally launched Edge cannot be attached after the fact. Let the bridge start the dedicated Edge profile, sign in in that visible window, and say “I am logged in. Continue.” Do not confuse the dedicated profile with your ordinary Edge login.
+
+### Composer or send button disappeared
+
+The bridge refreshes the original tab once and checks again. If recovery fails, it keeps the original target and pauses. It does not create another tab or resend the prompt.
+
+### The message would go to the wrong web conversation
+
+Say “Pause the web link,” repair the original tab's visible conversation, and explicitly resume. The bridge does not guess a new title.
+
+### OpenCode cannot see the MCP server
+
+Check that the OpenCode server type is `local`, the command array points to `scripts/mcp_server.mjs`, and OpenCode has been restarted. For managed execution, also check `opencode serve`, the port, and `OPENCODE_SERVER_URL`.
+
+### New tools do not appear after an update
+
+Restart Codex/OpenCode and create a new host conversation. Older conversations may cache old MCP tools and skills.
+
+## Development and verification
+
+Contributors can run from the repository root:
+
+```powershell
+npm test
+npm run check
+git diff --check
+```
+
+Current release: `0.8.0`. This release positions the repository as the Codex Bridge Toolkit Series, adds the parallel OpenCode host adapter, modular toolkit boundaries, and multi-session fail-closed orchestration.
+
+More design notes:
+
+- [Toolkit series design](docs/toolkit-series.md)
+- [OpenCode configuration template](examples/opencode/README.md)
+- [Codex native integration boundary](docs/codex-native-integration.md)
+- [Demo recording script](docs/demo-script.md)

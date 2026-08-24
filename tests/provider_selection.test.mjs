@@ -34,17 +34,20 @@ function startServer() {
       const resolver = pending.get(message.id);
       if (!resolver) continue;
       pending.delete(message.id);
-      resolver(message);
+      resolver.resolve(message);
     }
   });
   child.stderr.resume();
+  child.once("error", error => {
+    for (const { reject } of pending.values()) reject(error);
+    pending.clear();
+  });
   return {
     child,
     request(method, params = {}) {
       const id = nextId++;
       return new Promise((resolve, reject) => {
-        pending.set(id, resolve);
-        child.once("error", reject);
+        pending.set(id, { resolve, reject });
         child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
       });
     },
@@ -64,11 +67,29 @@ test("provider selection is exposed as an enum and persists on a session", async
     const linkListTool = toolsResponse.result.tools.find(tool => tool.name === "bridge_link_list");
     const watchdogTool = toolsResponse.result.tools.find(tool => tool.name === "browser_watchdog_scan");
     const githubTool = toolsResponse.result.tools.find(tool => tool.name === "github_workspace_status");
+    const githubBindTool = toolsResponse.result.tools.find(tool => tool.name === "github_workspace_bind");
+    const hostStatusTool = toolsResponse.result.tools.find(tool => tool.name === "bridge_host_status");
+    const artifactStatusTool = toolsResponse.result.tools.find(tool => tool.name === "artifact_workspace_status");
+    const artifactReadTool = toolsResponse.result.tools.find(tool => tool.name === "artifact_workspace_read");
+    const swarmCreateTool = toolsResponse.result.tools.find(tool => tool.name === "bridge_swarm_create");
+    const swarmStatusTool = toolsResponse.result.tools.find(tool => tool.name === "bridge_swarm_status");
     assert.ok(toolkitListTool);
     assert.ok(toolkitStatusTool);
     assert.ok(linkListTool);
     assert.ok(watchdogTool);
     assert.ok(githubTool);
+    assert.ok(githubBindTool);
+    assert.ok(hostStatusTool);
+    assert.ok(artifactStatusTool);
+    assert.ok(artifactReadTool);
+    assert.ok(swarmCreateTool);
+    assert.ok(swarmStatusTool);
+    assert.equal(hostStatusTool.inputSchema.properties.session_id, undefined);
+    assert.equal(artifactStatusTool.inputSchema.properties.session_id, undefined);
+    assert.equal(artifactReadTool.inputSchema.properties.session_id, undefined);
+    assert.equal(swarmCreateTool.inputSchema.properties.session_id, undefined);
+    assert.equal(swarmStatusTool.inputSchema.properties.session_id, undefined);
+    assert.deepEqual(swarmCreateTool.inputSchema.properties.members.maxItems, 32);
     const sessionTool = toolsResponse.result.tools.find(tool => tool.name === "brain_browser_session_create");
     const planTool = toolsResponse.result.tools.find(tool => tool.name === "brain_plan");
     const routeTool = toolsResponse.result.tools.find(tool => tool.name === "bridge_route_create");
@@ -87,9 +108,9 @@ test("provider selection is exposed as an enum and persists on a session", async
     assert.equal(sessionTool.inputSchema.properties.brain_provider.default, "chatgpt");
     assert.deepEqual(planTool.inputSchema.properties.brain_provider.enum, ["chatgpt", "deepseek"]);
     assert.equal(planTool.inputSchema.properties.brain_provider.default, undefined);
-    assert.deepEqual(routeTool.inputSchema.properties.executor_provider.enum, ["chatgpt_luna", "deepseek_api", "codex_current"]);
+    assert.deepEqual(routeTool.inputSchema.properties.executor_provider.enum, ["chatgpt_luna", "deepseek_api", "codex_current", "opencode"]);
     assert.equal(routeTool.inputSchema.properties.executor_provider.default, "chatgpt_luna");
-    assert.deepEqual(runTool.inputSchema.properties.executor_model.enum, ["gpt-5.6-luna", "deepseek-v4-pro", "deepseek-v4-flash"]);
+    assert.equal(runTool.inputSchema.properties.executor_model.type, "string");
     assert.ok(openTool.inputSchema.properties.target_id);
     assert.ok(openTool.inputSchema.properties.target_title);
     assert.ok(openTool.inputSchema.properties.target_url);
@@ -130,8 +151,10 @@ test("provider selection is exposed as an enum and persists on a session", async
     assert.equal(panel.result._meta.ui.resourceUri, "ui://codex-web-bridge/control-panel-v1.html");
 
     const toolkitList = await server.request("tools/call", { name: "bridge_toolkit_list", arguments: {} });
-    assert.equal(toolkitList.result.structuredContent.series_version, "0.3.0");
-    assert.deepEqual(toolkitList.result.structuredContent.toolkits.map(toolkit => toolkit.id), ["web-bridge", "browser-watchdog", "github-workspace"]);
+    assert.equal(toolkitList.result.structuredContent.series_version, "0.8.0");
+    assert.ok(toolkitList.result.structuredContent.toolkits.some(toolkit => toolkit.id === "mcp-host-compatibility"));
+    assert.ok(toolkitList.result.structuredContent.toolkits.some(toolkit => toolkit.id === "artifact-workspace"));
+    assert.deepEqual(toolkitList.result.structuredContent.toolkits.map(toolkit => toolkit.id), ["web-bridge", "executor-hosts", "browser-watchdog", "github-workspace", "mcp-host-compatibility", "artifact-workspace", "web-session-swarm"]);
 
     const toolkitStatus = await server.request("tools/call", { name: "bridge_toolkit_status", arguments: {} });
     assert.ok(Array.isArray(toolkitStatus.result.structuredContent.links));
@@ -142,11 +165,17 @@ test("provider selection is exposed as an enum and persists on a session", async
 
     const watchdogStart = await server.request("tools/call", {
       name: "browser_watchdog_start",
-      arguments: { name: "test-watchdog", port: 1, timeout_ms: 500 },
+      arguments: { name: "test-watchdog", route_id: "watchdog-route", port: 1, timeout_ms: 500 },
     });
     assert.equal(watchdogStart.result.structuredContent.started, true);
     assert.equal(watchdogStart.result.structuredContent.watchdog.lifecycle, "running");
     assert.equal(watchdogStart.result.structuredContent.watchdog.state, "browser_unreachable");
+    assert.equal(watchdogStart.result.structuredContent.watchdog.alert_count, 1);
+    const watchdogRoute = await server.request("tools/call", {
+      name: "bridge_route_status",
+      arguments: { route_id: "watchdog-route" },
+    });
+    assert.equal(watchdogRoute.result.structuredContent.route.browser_health.state, "browser_unreachable");
     const watchdogStop = await server.request("tools/call", {
       name: "browser_watchdog_stop",
       arguments: { name: "test-watchdog" },
@@ -157,15 +186,28 @@ test("provider selection is exposed as an enum and persists on a session", async
     assert.equal(workspace.result.structuredContent.ok, true);
     assert.equal(workspace.result.structuredContent.read_only, true);
 
+    const hostStatus = await server.request("tools/call", { name: "bridge_host_status", arguments: { host: "devspace" } });
+    assert.equal(hostStatus.result.structuredContent.selected_host, "devspace");
+    assert.equal(hostStatus.result.structuredContent.selected.status, "generic_mcp_compatible");
+
+    const artifacts = await server.request("tools/call", { name: "artifact_workspace_status", arguments: { cwd: repoRoot, max_depth: 1, max_files: 10 } });
+    assert.equal(artifacts.result.structuredContent.ok, true);
+    assert.equal(artifacts.result.structuredContent.read_only, true);
+    assert.equal(artifacts.result.structuredContent.integrations.notion.api_adapter, false);
+    const artifactRead = await server.request("tools/call", { name: "artifact_workspace_read", arguments: { cwd: repoRoot, files: ["README.md"], max_total_chars: 1200, max_file_chars: 800 } });
+    assert.equal(artifactRead.result.structuredContent.ok, true);
+    assert.equal(artifactRead.result.structuredContent.content_files, 1);
+
     const providerList = await server.request("tools/call", { name: "brain_provider_list", arguments: {} });
     assert.equal(providerList.result.structuredContent.default_provider, "chatgpt");
     assert.deepEqual(providerList.result.structuredContent.providers.map(provider => provider.id), ["chatgpt", "deepseek"]);
 
     const executorList = await server.request("tools/call", { name: "executor_provider_list", arguments: {} });
     assert.equal(executorList.result.structuredContent.default_provider, "chatgpt_luna");
-    assert.deepEqual(executorList.result.structuredContent.providers.map(provider => provider.id), ["chatgpt_luna", "deepseek_api", "codex_current"]);
+    assert.deepEqual(executorList.result.structuredContent.providers.map(provider => provider.id), ["chatgpt_luna", "deepseek_api", "codex_current", "opencode"]);
     assert.deepEqual(executorList.result.structuredContent.providers[1].models, ["deepseek-v4-pro", "deepseek-v4-flash"]);
     assert.equal(executorList.result.structuredContent.providers[2].inherit_config, true);
+    assert.equal(executorList.result.structuredContent.providers[3].kind, "opencode");
 
     const created = await server.request("tools/call", {
       name: "brain_browser_session_create",

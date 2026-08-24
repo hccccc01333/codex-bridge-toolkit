@@ -55,6 +55,8 @@ import {
   DEFAULT_EXECUTOR_PROVIDER,
   codexLaunchArgs,
   executorModelOf,
+  executorEndpointOf,
+  normalizeExecutorAgent,
   executorProfileOf as codexProfileOf,
   getExecutorProvider,
   listExecutorProviders,
@@ -62,6 +64,7 @@ import {
   normalizeExecutorProvider,
 } from "../src/adapters/executor.mjs";
 import { createCodexAdapter } from "../src/adapters/codex.mjs";
+import { createOpenCodeAdapter } from "../src/adapters/opencode.mjs";
 import { getWebLLMAdapter } from "../src/adapters/provider_registry.mjs";
 import { createRuntimeRunner } from "../src/runtime/runner.mjs";
 import {
@@ -71,6 +74,18 @@ import {
 } from "../src/bridge/relay_contract.mjs";
 import { compileUserGoal } from "../src/bridge/goal_compiler.mjs";
 import { createRelayEngine } from "../src/bridge/relay_engine.mjs";
+import {
+  appendSwarmEvent,
+  findSwarmByName,
+  listSwarms,
+  maxMembers,
+  memberByLabel,
+  newSwarmRecord,
+  publicSwarm,
+  readSwarm,
+  workerContextOf,
+  writeSwarm,
+} from "../src/orchestration/swarm_state.mjs";
 import {
   WEB_PROMPT_MAX_CHARS,
   WEB_REPLY_MIN_STABLE_MS,
@@ -83,6 +98,9 @@ import { createPanelServer } from "./panel_server.mjs";
 import { TOOLKIT_SERIES_VERSION, listToolkits } from "../src/toolkits/registry.mjs";
 import { inspectGithubWorkspace } from "../src/toolkits/github_workspace.mjs";
 import { scanBrowser } from "../src/toolkits/browser_watchdog.mjs";
+import { hostCompatibilityStatus } from "../src/toolkits/host_compatibility.mjs";
+import { inspectArtifactWorkspace, readArtifactContext } from "../src/toolkits/artifact_workspace.mjs";
+import { createRouteWorkerPool } from "../src/control_plane/route_worker_pool.mjs";
 import {
   browserInstanceFromEndpoint,
   discoveryText,
@@ -112,6 +130,7 @@ const SERVER_VERSION = "0.1.0";
 const MCP_UI_RESOURCE_URI = "ui://codex-web-bridge/control-panel-v1.html";
 const MCP_UI_RESOURCE_MIME = "text/html;profile=mcp-app";
 const SERVER_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const IS_ROUTE_WORKER = process.env.CODEX_BRIDGE_ROUTE_WORKER === "1";
 const MCP_UI_RESOURCE_PATH = path.join(SERVER_ROOT, "ui", "mcp_control_panel.html");
 const DEFAULT_MAX_ROUNDS = STOP_DEFAULT_MAX_ROUNDS;
 const HARD_MAX_ROUNDS = STOP_HARD_MAX_ROUNDS;
@@ -132,17 +151,24 @@ function executorProviderSchema({ includeDefault = false } = {}) {
   const schema = {
     type: "string",
     enum: listExecutorProviders().map(provider => provider.id),
-    description: "Select the Codex executor provider. ChatGPT Luna is the default; DeepSeek API exposes Pro and Flash models.",
+    description: "Select the local executor. ChatGPT Luna is the default; DeepSeek API exposes Pro/Flash, and OpenCode uses a user-started local HTTP server.",
   };
   if (includeDefault) schema.default = DEFAULT_EXECUTOR_PROVIDER;
   return schema;
 }
 
 function executorModelSchema() {
+  const providers = listExecutorProviders();
+  if (providers.some(provider => provider.allow_custom_model)) {
+    return {
+      type: "string",
+      description: "Optional executor model. OpenCode accepts the configured provider/model name; leave empty to inherit its local default.",
+    };
+  }
   return {
     type: "string",
-    enum: [...new Set(listExecutorProviders().flatMap(provider => provider.models))],
-    description: "Optional Codex executor model. Leave empty to use the selected provider's default; DeepSeek supports deepseek-v4-pro and deepseek-v4-flash.",
+    enum: [...new Set(providers.flatMap(provider => provider.models))],
+    description: "Optional executor model. Leave empty to use the selected provider's default.",
   };
 }
 
@@ -172,6 +198,13 @@ let pendingDedicatedLaunch = null;
 const watchdogRuns = new Map();
 const pendingBrainTargetCreation = new Map();
 const execFileAsync = promisify(execFile);
+const routeWorkerPool = IS_ROUTE_WORKER ? null : createRouteWorkerPool({
+  script: fileURLToPath(import.meta.url),
+  cwd: SERVER_ROOT,
+  env: process.env,
+});
+
+process.once("exit", () => routeWorkerPool?.closeAll());
 
 function normalizeHostCodexContext(raw) {
   if (!raw || typeof raw !== "object") return null;
@@ -182,6 +215,20 @@ function normalizeHostCodexContext(raw) {
     thread_id: threadId || null,
     title: title || null,
     source: "codex_host_context",
+  };
+}
+
+function executorEndpointSchema() {
+  return {
+    type: "string",
+    description: "OpenCode server URL, for example http://127.0.0.1:4096. Leave empty to use OPENCODE_SERVER_URL or the local default.",
+  };
+}
+
+function executorAgentSchema() {
+  return {
+    type: "string",
+    description: "Optional OpenCode agent name. Leave empty to use OpenCode's default agent.",
   };
 }
 
@@ -319,6 +366,19 @@ function executorProfileFor(args = {}, provider = executorProviderOf(args), mode
   if (explicit) return explicit;
   const resolvedModel = model === undefined ? executorModelFor(args, provider) : model;
   return codexProfileOf(provider, "", resolvedModel);
+}
+
+function executorEndpointFor(args = {}, provider = executorProviderOf(args)) {
+  const requested = args.executor_endpoint ?? args.executorEndpoint;
+  const selected = requested !== undefined ? requested : activeRoute?.executor_endpoint || "";
+  return executorEndpointOf(provider, selected);
+}
+
+function executorAgentFor(args = {}, provider = executorProviderOf(args)) {
+  if (provider.kind !== "opencode") return "";
+  const requested = args.executor_agent ?? args.executorAgent;
+  const selected = requested !== undefined ? requested : activeRoute?.executor_agent || "";
+  return normalizeExecutorAgent(selected);
 }
 
 function newSessionState(sessionId, name = "", brainProvider = DEFAULT_BRAIN_PROVIDER) {
@@ -473,10 +533,10 @@ function brainProviderList() {
 }
 
 function executorProviderList() {
-  return jsonResult("supported Codex executor providers", {
+  return jsonResult("supported local executor hosts", {
     default_provider: DEFAULT_EXECUTOR_PROVIDER,
     providers: listExecutorProviders(),
-    note: "The bridge selects local Codex profiles; API keys remain managed by Codex configuration or environment.",
+    note: "Codex uses its local App Server profile; OpenCode uses a user-started local serve endpoint. Credentials remain managed by the host or environment and are never collected by the bridge.",
   });
 }
 
@@ -490,6 +550,7 @@ function publicToolkitLink(route) {
     brain_provider: route.brain_provider || DEFAULT_BRAIN_PROVIDER,
     executor_provider: route.executor_provider || DEFAULT_EXECUTOR_PROVIDER,
     executor_model: route.executor_model || null,
+    executor_endpoint: route.executor_endpoint || null,
     conversation: conversation ? {
       title: conversation.title || "当前网页对话",
       url: conversation.url || null,
@@ -503,6 +564,17 @@ function publicToolkitLink(route) {
       source: "unbound",
       verified: false,
     },
+    workspace: route.workspace ? {
+      name: route.workspace.name || route.workspace.root || null,
+      github: Boolean(route.workspace.github),
+      branch: route.workspace.branch || null,
+      changes: Array.isArray(route.workspace.changes) ? route.workspace.changes.length : 0,
+    } : null,
+    browser_health: route.browser_health ? {
+      state: route.browser_health.state || "unknown",
+      message: route.browser_health.message || null,
+      checked_at: route.browser_health.checked_at || null,
+    } : null,
     round: Number(route.round || session?.round || 0),
     updated_at: route.updated_at || session?.updated_at || null,
   };
@@ -518,6 +590,11 @@ function toolkitCatalog() {
     default_toolkit: "web-bridge",
     toolkits: listToolkits(),
     links: bridgeLinkList(),
+    parallel_execution: {
+      enabled: !IS_ROUTE_WORKER,
+      isolation: "one MCP worker process per Codex host context",
+      note: "独立 Codex 对话使用独立 worker；同一连接内仍按 route 串行化操作。",
+    },
     defaults: {
       browser_automation: "visible_cdp_only",
       github_actions: "read_only",
@@ -538,6 +615,14 @@ function toolkitStatus() {
     links: bridgeLinkList(),
     active_link: publicBridgeLink(),
     watchdogs: [...watchdogRuns.values()].map(watchdogPublicView),
+    parallel_execution: routeWorkerPool ? {
+      enabled: true,
+      worker_processes: routeWorkerPool.status().count,
+      isolation: "one MCP worker process per Codex host context",
+    } : {
+      enabled: false,
+      role: "route worker",
+    },
   });
 }
 
@@ -550,6 +635,8 @@ function watchdogPublicView(run) {
     lifecycle: run.lifecycle,
     state: run.state,
     checks: run.checks,
+    alert_count: run.alert_count,
+    last_alert: run.last_alert || null,
     started_at: run.started_at,
     last_checked_at: run.last_checked_at,
     last_result: run.last_result || null,
@@ -567,6 +654,43 @@ function watchdogArgs(args = {}) {
     target_url: args.target_url || args.targetUrl,
     timeout_ms: args.timeout_ms,
   };
+}
+
+function healthAlertFor(result, run) {
+  const state = String(result?.state || "unknown");
+  if (["healthy", "generating"].includes(state)) return null;
+  if (state === "generation_timeout") return "网页模型持续生成超时，可能卡死或停止响应";
+  if (state === "selector_degraded") return "网页模型页面选择器降级，页面可能已更新";
+  if (state === "composer_missing") return "网页编辑器或发送控件不可用";
+  if (state === "page_unresponsive") return "网页标签页无响应";
+  if (state === "login_required") return "网页端登录状态丢失";
+  if (state === "browser_unreachable") return "浏览器调试端点不可达";
+  if (state === "provider_tab_not_found") return "没有找到绑定的网页模型标签页";
+  if (state === "target_selection_required") return "网页模型标签页不唯一，需要重新确认目标";
+  if (state === "page_loading") return "网页模型页面仍在加载";
+  return `网页模型健康状态异常：${state}`;
+}
+
+function persistWatchdogAlert(run, result, alert) {
+  if (!alert || !run.route_id) return;
+  const changed = run.last_alert?.state !== result.state || run.last_alert?.message !== alert;
+  if (!changed) return;
+  const entry = {
+    state: result.state,
+    message: alert,
+    checked_at: result.checked_at || new Date().toISOString(),
+  };
+  run.alert_count += 1;
+  run.last_alert = entry;
+  const route = updateRoute(run.route_id, {
+    browser_health: entry,
+    last_action: "browser_watchdog_alert",
+  });
+  appendRouteEvent(route.route_id, {
+    type: "BROWSER_HEALTH_ALERT",
+    summary: alert,
+    data: { state: entry.state, provider: result.provider, tab: result.tab || null },
+  });
 }
 
 async function browserWatchdogScan(args = {}) {
@@ -593,12 +717,17 @@ async function browserWatchdogStart(args = {}) {
     lifecycle: "starting",
     state: "starting",
     checks: 0,
+    alert_count: 0,
+    last_alert: null,
     started_at: new Date().toISOString(),
     last_checked_at: null,
     last_result: null,
     error: null,
     timer: null,
     in_flight: false,
+    generation_started_at: null,
+    generation_timeout_ms: Math.min(Math.max(Number(args.generation_timeout_ms) || 180000, 15000), 30 * 60 * 1000),
+    route_id: args.route_id || args.routeId || null,
     args: watchdogArgs(args),
   };
   watchdogRuns.set(name, run);
@@ -607,11 +736,23 @@ async function browserWatchdogStart(args = {}) {
     run.in_flight = true;
     try {
       const result = await scanBrowser(run.args);
+      if (result.state === "generating") {
+        run.generation_started_at ||= Date.now();
+        if (Date.now() - run.generation_started_at >= run.generation_timeout_ms) {
+          result.state = "generation_timeout";
+          result.ok = false;
+          result.message = `网页模型已持续生成超过 ${Math.round(run.generation_timeout_ms / 1000)} 秒`;
+          result.recovery = "不要自动重发；先检查原标签页，必要时只刷新原标签页。";
+        }
+      } else {
+        run.generation_started_at = null;
+      }
       run.checks += 1;
       run.last_checked_at = new Date().toISOString();
       run.last_result = result;
       run.state = result.state;
       run.error = null;
+      persistWatchdogAlert(run, result, healthAlertFor(result, run));
     } catch (error) {
       run.checks += 1;
       run.last_checked_at = new Date().toISOString();
@@ -652,6 +793,80 @@ function browserWatchdogStop(args = {}) {
 async function githubWorkspaceStatus(args = {}) {
   const result = await inspectGithubWorkspace({ cwd: args.cwd || process.cwd() });
   return jsonResult(result.ok ? `GitHub 工作区：${result.repository?.name || "本地仓库"}` : result.message, result, !result.ok);
+}
+
+function bridgeHostStatus(args = {}) {
+  const result = hostCompatibilityStatus({ host: args.host || "generic" });
+  return jsonResult(`MCP 宿主兼容性：${result.selected.display_name}`, result);
+}
+
+async function artifactWorkspaceStatus(args = {}) {
+  const result = await inspectArtifactWorkspace({
+    cwd: args.cwd || process.cwd(),
+    max_depth: args.max_depth,
+    max_files: args.max_files,
+  });
+  return jsonResult(result.ok ? `本地素材扫描：${result.state}` : result.message, result, !result.ok);
+}
+
+async function artifactWorkspaceRead(args = {}) {
+  const result = await readArtifactContext({
+    cwd: args.cwd || process.cwd(),
+    files: args.files,
+    max_total_chars: args.max_total_chars,
+    max_file_chars: args.max_file_chars,
+  });
+  return jsonResult(result.ok ? `本地素材读取：${result.state}` : result.message, result, !result.ok);
+}
+
+function compactWorkspaceBinding(result) {
+  if (!result?.ok) return null;
+  return {
+    root: result.repository?.root || null,
+    name: result.repository?.name || null,
+    github: Boolean(result.repository?.github),
+    branch: result.branch || null,
+    upstream: result.upstream || null,
+    ahead: Number(result.ahead || 0),
+    behind: Number(result.behind || 0),
+    head: result.head || null,
+    changes: Array.isArray(result.changes) ? result.changes.slice(0, 40) : [],
+    bound_at: new Date().toISOString(),
+  };
+}
+
+function workspacePromptState(workspace) {
+  if (!workspace) return undefined;
+  return JSON.stringify({
+    repository: workspace.name || "local repository",
+    github: Boolean(workspace.github),
+    branch: workspace.branch || null,
+    upstream: workspace.upstream || null,
+    head: workspace.head || null,
+    changes: Array.isArray(workspace.changes) ? workspace.changes : [],
+  });
+}
+
+async function bindGithubWorkspace(args = {}) {
+  const id = routeIdOf(args);
+  const result = await inspectGithubWorkspace({ cwd: args.cwd || process.cwd() });
+  if (!result.ok) return jsonResult(result.message, { bound: false, workspace: result }, true);
+  const workspace = compactWorkspaceBinding(result);
+  const route = updateRoute(id, {
+    workspace,
+    last_action: "github_workspace_bind",
+  });
+  appendRouteEvent(id, {
+    type: "WORKSPACE_BOUND",
+    summary: `workspace bound: ${workspace.name || workspace.root || "local repository"}`,
+    data: { github: workspace.github, branch: workspace.branch, changes: workspace.changes.length },
+  });
+  return jsonResult(`已绑定 GitHub 工作区：${workspace.name || workspace.root}`, {
+    bound: true,
+    workspace,
+    route: routeSummary(readRoute(id)),
+    read_only: true,
+  });
 }
 
 function routeSessionIdOf(args = {}, route = null) {
@@ -696,6 +911,8 @@ function syncActiveRoute(extra = {}) {
     executor_provider: activeRoute.executor_provider || DEFAULT_EXECUTOR_PROVIDER,
     executor_model: activeRoute.executor_model || null,
     executor_profile: activeRoute.executor_profile || null,
+    executor_endpoint: activeRoute.executor_endpoint || null,
+    executor_agent: activeRoute.executor_agent || null,
     session_id: activeSessionId,
     target_id: activeSession?.target_id || activeTargetId || null,
     conversation_id: activeSession?.conversation?.id || selectedConversation?.id || null,
@@ -724,12 +941,18 @@ function activateRoute(args = {}) {
     : route.executor_provider || DEFAULT_EXECUTOR_PROVIDER;
   const executorModel = args.executor_model ?? args.executorModel ?? route.executor_model ?? null;
   const executorProfile = normalizeCodexProfile(args.executor_profile ?? args.executorProfile ?? route.executor_profile ?? "");
+  const executorEndpoint = executorEndpointOf(executorProviderId, args.executor_endpoint ?? args.executorEndpoint ?? route.executor_endpoint ?? "");
+  const executorAgent = executorProviderId === "opencode"
+    ? normalizeExecutorAgent(args.executor_agent ?? args.executorAgent ?? route.executor_agent ?? "")
+    : "";
   executorModelOf(executorProviderId, executorModel || "");
   if (explicitRoute && (route.session_id !== sessionId
     || route.brain_provider !== providerId
     || route.executor_provider !== executorProviderId
     || route.executor_model !== executorModel
-    || route.executor_profile !== (executorProfile || null))) {
+    || route.executor_profile !== (executorProfile || null)
+    || route.executor_endpoint !== (executorEndpoint || null)
+    || route.executor_agent !== (executorAgent || null))) {
     route = writeRoute({
       ...route,
       session_id: sessionId,
@@ -737,6 +960,8 @@ function activateRoute(args = {}) {
       executor_provider: executorProviderId,
       executor_model: executorModel,
       executor_profile: executorProfile || null,
+      executor_endpoint: executorEndpoint || null,
+      executor_agent: executorAgent || null,
     });
   }
   activeRouteId = id;
@@ -778,6 +1003,12 @@ function routeCreate(args = {}) {
   catch (error) { return jsonResult(String(error), { created: false }, true); }
   try { executorProfile = normalizeCodexProfile(args.executor_profile ?? args.executorProfile ?? ""); }
   catch (error) { return jsonResult(String(error), { created: false }, true); }
+  let executorEndpoint;
+  let executorAgent;
+  try { executorEndpoint = executorEndpointOf(executorProvider, args.executor_endpoint ?? args.executorEndpoint ?? ""); }
+  catch (error) { return jsonResult(String(error), { created: false }, true); }
+  try { executorAgent = executorProvider === "opencode" ? normalizeExecutorAgent(args.executor_agent ?? args.executorAgent ?? "") : ""; }
+  catch (error) { return jsonResult(String(error), { created: false }, true); }
   const hostContext = hostCodexContextOf(args);
   const route = newRouteRecord(id, {
     name: args.name,
@@ -785,6 +1016,8 @@ function routeCreate(args = {}) {
     executor_provider: executorProvider,
     executor_model: executorModel,
     executor_profile: executorProfile || null,
+    executor_endpoint: executorEndpoint || null,
+    executor_agent: executorAgent || null,
     codex_thread_id: args.codex_thread_id ?? args.codexThreadId ?? hostContext?.thread_id,
     codex_binding: hostContext?.thread_id ? {
       state: "bound",
@@ -847,6 +1080,14 @@ function routeBind(args = {}) {
   catch (error) { return jsonResult(String(error), { bound: false }, true); }
   try { executorProfile = normalizeCodexProfile(args.executor_profile ?? args.executorProfile ?? route.executor_profile ?? ""); }
   catch (error) { return jsonResult(String(error), { bound: false }, true); }
+  let executorEndpoint;
+  let executorAgent;
+  try { executorEndpoint = executorEndpointOf(executorProvider, args.executor_endpoint ?? args.executorEndpoint ?? route.executor_endpoint ?? ""); }
+  catch (error) { return jsonResult(String(error), { bound: false }, true); }
+  try { executorAgent = executorProvider === "opencode"
+    ? normalizeExecutorAgent(args.executor_agent ?? args.executorAgent ?? route.executor_agent ?? "")
+    : ""; }
+  catch (error) { return jsonResult(String(error), { bound: false }, true); }
   route = writeRoute({
     ...route,
     name: args.name || route.name,
@@ -854,6 +1095,8 @@ function routeBind(args = {}) {
     executor_provider: executorProvider,
     executor_model: executorModel,
     executor_profile: executorProfile || null,
+    executor_endpoint: executorEndpoint || null,
+    executor_agent: executorAgent || null,
     codex_thread_id: args.codex_thread_id ?? args.codexThreadId ?? route.codex_thread_id,
     session_id: session.session_id,
     target_id: args.target_id ?? args.targetId ?? session.target_id ?? route.target_id,
@@ -892,13 +1135,17 @@ function routeEvent(args = {}) {
   });
 }
 
-function codexAdapterForRoute(routeId, executorProviderId = undefined, executorModel = "", executorProfile = "") {
+function codexAdapterForRoute(routeId, executorProviderId = undefined, executorModel = "", executorProfile = "", executorEndpoint = "", executorAgent = "") {
   const id = normalizeRouteId(routeId);
   const route = readRoute(id);
   const provider = getExecutorProvider(executorProviderId || route.executor_provider || DEFAULT_EXECUTOR_PROVIDER);
   const model = executorModelOf(provider, executorModel || route.executor_model);
   const profile = executorProfileFor({ executor_profile: executorProfile || route.executor_profile }, provider, model);
-  const adapterKey = `${provider.id}:${model || "(config)"}:${profile || "(config)"}`;
+  const endpoint = executorEndpointOf(provider, executorEndpoint || route.executor_endpoint || "");
+  const agent = provider.kind === "opencode"
+    ? normalizeExecutorAgent(executorAgent || route.executor_agent || "")
+    : "";
+  const adapterKey = `${provider.id}:${model || "(config)"}:${profile || "(config)"}:${endpoint || "(local)"}:${agent || "(default)"}`;
   let adapter = codexAdapters.get(id);
   if (adapter && adapter.executor_key !== adapterKey) {
     const state = adapter.status().state;
@@ -913,22 +1160,33 @@ function codexAdapterForRoute(routeId, executorProviderId = undefined, executorM
     }
   }
   if (!adapter) {
-    adapter = createCodexAdapter({
-      cwd: process.cwd(),
-      args: codexLaunchArgs(provider, model, profile),
-      onNotification: message => {
-        if (message.method === "turn/completed") {
-          appendRouteEvent(id, {
-            type: "CODEX_TURN_COMPLETED",
-            summary: `Codex turn completed: ${message.params?.turn?.status || "unknown"}`,
-          });
-        }
-      },
-    });
+    if (provider.kind === "opencode") {
+      adapter = createOpenCodeAdapter({
+        endpoint,
+        cwd: route.workspace?.root || process.cwd(),
+        model,
+        agent,
+      });
+    } else {
+      adapter = createCodexAdapter({
+        cwd: process.cwd(),
+        args: codexLaunchArgs(provider, model, profile),
+        onNotification: message => {
+          if (message.method === "turn/completed") {
+            appendRouteEvent(id, {
+              type: "CODEX_TURN_COMPLETED",
+              summary: `Codex turn completed: ${message.params?.turn?.status || "unknown"}`,
+            });
+          }
+        },
+      });
+    }
     adapter.executor_key = adapterKey;
     adapter.executor_provider = provider.id;
     adapter.executor_model = model;
     adapter.executor_profile = profile || null;
+    adapter.executor_endpoint = endpoint || null;
+    adapter.executor_agent = agent || null;
     codexAdapters.set(id, adapter);
   }
   return adapter;
@@ -940,11 +1198,15 @@ function codexAdapterStatus(args = {}) {
   const provider = executorProviderOf(args, route.executor_provider || DEFAULT_EXECUTOR_PROVIDER);
   const model = executorModelOf(provider, args.executor_model ?? args.executorModel ?? route.executor_model);
   const profile = executorProfileFor(args, provider, model);
+  const endpoint = executorEndpointFor(args, provider);
+  const agent = executorAgentFor(args, provider);
   return jsonResult(`Codex Adapter status: ${id}`, {
-    adapter: codexAdapterForRoute(id, provider.id, model, profile).status(),
+    adapter: codexAdapterForRoute(id, provider.id, model, profile, endpoint, agent).status(),
     executor_provider: provider.id,
     executor_model: model,
     executor_profile: profile || null,
+    executor_endpoint: endpoint || null,
+    executor_agent: agent || null,
     route: routeSummary(route),
   });
 }
@@ -962,12 +1224,16 @@ async function codexThreadStart(args = {}) {
     const provider = executorProviderOf(args, route.executor_provider || DEFAULT_EXECUTOR_PROVIDER);
     const model = executorModelFor({ ...args, executor_model: args.executor_model ?? args.executorModel ?? args.model ?? route.executor_model }, provider);
     const profile = executorProfileFor(args, provider, model);
+    const endpoint = executorEndpointFor(args, provider);
+    const agent = executorAgentFor(args, provider);
     route = updateRoute(route.route_id, {
       executor_provider: provider.id,
       executor_model: model,
       executor_profile: args.executor_profile ?? args.executorProfile ?? route.executor_profile ?? null,
+      executor_endpoint: endpoint || null,
+      executor_agent: agent || null,
     });
-    const adapter = codexAdapterForRoute(route.route_id, provider.id, model, profile);
+    const adapter = codexAdapterForRoute(route.route_id, provider.id, model, profile, endpoint, agent);
     const requestedThreadId = explicitlyRequestedThread || route.codex_thread_id || hostContext?.thread_id || null;
     const bindingSource = hostContext?.thread_id && requestedThreadId === hostContext.thread_id
       ? "current_codex_conversation"
@@ -978,6 +1244,7 @@ async function codexThreadStart(args = {}) {
       model,
       baseInstructions: args.base_instructions,
       approvalPolicy: args.approval_policy,
+      title: args.title || "Codex Bridge task",
     });
     const updated = updateRoute(route.route_id, {
       codex_thread_id: result.thread_id,
@@ -1003,6 +1270,8 @@ async function codexThreadStart(args = {}) {
       executor_provider: provider.id,
       executor_model: model,
       executor_profile: profile || null,
+      executor_endpoint: endpoint || null,
+      executor_agent: agent || null,
       codex_binding: codexBindingView(updated),
       route: routeSummary(updated),
       adapter: adapter.status(),
@@ -1034,7 +1303,9 @@ async function syncCodexNativeGoal({ routeId = activeRouteId, objective, status 
     const provider = getExecutorProvider(route.executor_provider || DEFAULT_EXECUTOR_PROVIDER);
     const model = executorModelOf(provider, route.executor_model || "");
     const profile = codexProfileOf(provider, route.executor_profile || "", model);
-    const adapter = codexAdapterForRoute(id, provider.id, model, profile);
+    const endpoint = executorEndpointOf(provider, route.executor_endpoint || "");
+    const agent = provider.kind === "opencode" ? normalizeExecutorAgent(route.executor_agent || "") : "";
+    const adapter = codexAdapterForRoute(id, provider.id, model, profile, endpoint, agent);
     const result = await adapter.setThreadGoal({
       thread_id: route.codex_thread_id,
       objective: goal,
@@ -1042,21 +1313,24 @@ async function syncCodexNativeGoal({ routeId = activeRouteId, objective, status 
       tokenBudget,
     });
     const native = result?.goal || {};
+    const method = result?.method || (result?.local_only ? "bridge_goal" : "thread/goal/set");
     const synced = {
       synced: true,
-      state: "synced",
-      method: "thread/goal/set",
+      state: result?.local_only ? "bridge_goal_only" : "synced",
+      method,
       thread_id: route.codex_thread_id,
       objective: native.objective || goal,
       status: native.status || status,
       token_budget: native.tokenBudget ?? tokenBudget ?? null,
+      local_only: Boolean(result?.local_only),
+      executor_provider: provider.id,
       synced_at: new Date().toISOString(),
     };
     const updated = updateRoute(id, { native_goal: synced, last_action: "codex_thread_goal_set" });
     appendRouteEvent(id, {
       type: "CODEX_GOAL_SYNCED",
-      summary: `Codex native Goal synced: ${route.codex_thread_id}`,
-      data: { method: synced.method, status: synced.status },
+      summary: `${provider.id} goal state recorded: ${route.codex_thread_id}`,
+      data: { method: synced.method, status: synced.status, local_only: synced.local_only },
     });
     if (activeRouteId === id) activeRoute = readRoute(id);
     return { ...synced, route: routeSummary(updated) };
@@ -1067,7 +1341,7 @@ async function syncCodexNativeGoal({ routeId = activeRouteId, objective, status 
       code: error.code || "CODEX_GOAL_SYNC_FAILED",
       reason: String(error),
       thread_id: route.codex_thread_id,
-      method: "thread/goal/set",
+      method: route.executor_provider === "opencode" ? "bridge_goal" : "thread/goal/set",
     };
     const updated = updateRoute(id, { native_goal: failed, last_action: "codex_thread_goal_sync_failed" });
     appendRouteEvent(id, {
@@ -1088,12 +1362,16 @@ async function codexThreadTurn(args = {}) {
     const provider = executorProviderOf(args, route.executor_provider || DEFAULT_EXECUTOR_PROVIDER);
     const model = executorModelFor({ ...args, executor_model: args.executor_model ?? args.executorModel ?? args.model ?? route.executor_model }, provider);
     const profile = executorProfileFor(args, provider, model);
+    const endpoint = executorEndpointFor(args, provider);
+    const agent = executorAgentFor(args, provider);
     route = updateRoute(route.route_id, {
       executor_provider: provider.id,
       executor_model: model,
       executor_profile: args.executor_profile ?? args.executorProfile ?? route.executor_profile ?? null,
+      executor_endpoint: endpoint || null,
+      executor_agent: agent || null,
     });
-    const result = await codexAdapterForRoute(route.route_id, provider.id, model, profile).sendTask({
+    const result = await codexAdapterForRoute(route.route_id, provider.id, model, profile, endpoint, agent).sendTask({
       thread_id: threadId,
       text: args.text || args.task || args.prompt,
       input: args.input,
@@ -1101,6 +1379,7 @@ async function codexThreadTurn(args = {}) {
       cwd: args.cwd,
       model,
       effort: args.effort,
+      agent,
     });
     const updated = updateRoute(route.route_id, {
       codex_thread_id: threadId,
@@ -1117,6 +1396,8 @@ async function codexThreadTurn(args = {}) {
       executor_provider: provider.id,
       executor_model: model,
       executor_profile: profile || null,
+      executor_endpoint: endpoint || null,
+      executor_agent: agent || null,
       route: routeSummary(updated),
     });
   } catch (error) {
@@ -1132,8 +1413,10 @@ async function codexThreadRead(args = {}) {
     const provider = executorProviderOf(args, route.executor_provider || DEFAULT_EXECUTOR_PROVIDER);
     const model = executorModelFor({ ...args, executor_model: args.executor_model ?? args.executorModel ?? args.model ?? route.executor_model }, provider);
     const profile = executorProfileFor(args, provider, model);
-    const result = await codexAdapterForRoute(route.route_id, provider.id, model, profile).readThread(threadId);
-    return jsonResult(`Codex thread read: ${threadId}`, { read: true, thread_id: threadId, executor_provider: provider.id, executor_model: model, executor_profile: profile || null, result });
+    const endpoint = executorEndpointFor(args, provider);
+    const agent = executorAgentFor(args, provider);
+    const result = await codexAdapterForRoute(route.route_id, provider.id, model, profile, endpoint, agent).readThread(threadId);
+    return jsonResult(`Codex/OpenCode session read: ${threadId}`, { read: true, thread_id: threadId, executor_provider: provider.id, executor_model: model, executor_profile: profile || null, executor_endpoint: endpoint || null, executor_agent: agent || null, result });
   } catch (error) {
     return jsonResult(String(error), { read: false, route_id: route.route_id, code: error.code || "CODEX_ADAPTER_ERROR" }, true);
   }
@@ -2116,14 +2399,28 @@ function publicBridgeLink(extra = {}) {
     connected: false,
     message: "还没有网页端连接。可以说“连接 ChatGPT 网页端”开始扫描。",
   };
+  const workspace = activeBridgeLink.workspace || activeRoute?.workspace || null;
   return {
     state: activeBridgeLink.state,
     connected: ["ready", "connected", "running", "awaiting_goal"].includes(activeBridgeLink.state),
     provider: activeBridgeLink.provider,
+    executor_host: activeRoute?.executor_provider || DEFAULT_EXECUTOR_PROVIDER,
+    executor_model: activeRoute?.executor_model || null,
+    executor_endpoint: activeRoute?.executor_endpoint || null,
     browser: activeBridgeLink.browser,
     window: activeBridgeLink.window,
     tab: activeBridgeLink.tab,
     conversation: activeBridgeLink.conversation,
+    workspace: workspace ? {
+      name: workspace.name
+        || workspace.root
+        || null,
+      github: Boolean(workspace.github),
+      branch: workspace.branch || null,
+      changes: Array.isArray(workspace.changes)
+        ? workspace.changes.length
+        : 0,
+    } : null,
     mode: activeBridgeLink.config ? userFacingRelayMode(activeBridgeLink.config) : null,
     direction: activeBridgeLink.config?.direction || null,
     rounds: activeBridgeLink.config?.rounds ?? null,
@@ -2134,6 +2431,11 @@ function publicBridgeLink(extra = {}) {
       ? "attached"
       : activeBridgeLink.state === "awaiting_goal" ? "awaiting_user" : "none",
     native_goal: activeBridgeLink.native_goal || activeRoute?.native_goal || null,
+    browser_health: activeRoute?.browser_health ? {
+      state: activeRoute.browser_health.state || "unknown",
+      message: activeRoute.browser_health.message || null,
+      checked_at: activeRoute.browser_health.checked_at || null,
+    } : null,
     run: activeBridgeRun ? {
       state: activeBridgeRun.state,
       status: activeBridgeRun.status || null,
@@ -2298,8 +2600,8 @@ async function bridgeConnect(args = {}) {
     }, true);
   }
 
-  const sessionId = internalBridgeId("link-session");
-  const routeId = internalBridgeId("link-route");
+  const sessionId = args.__session_id || internalBridgeId("link-session");
+  const routeId = args.__route_id || internalBridgeId("link-route");
   const sessionResult = createSession({ session_id: sessionId, name: "网页端连接", brain_provider: provider.id });
   if (sessionResult.isError) return sessionResult;
   const routeResult = routeCreate({
@@ -2310,11 +2612,30 @@ async function bridgeConnect(args = {}) {
     executor_provider: args.executor_provider,
     executor_model: args.executor_model,
     executor_profile: args.executor_profile,
+    executor_endpoint: args.executor_endpoint,
+    executor_agent: args.executor_agent,
     __host_codex_context: hostCodexContextOf(args),
   });
   if (routeResult.isError) return routeResult;
   activeRouteId = routeId;
   activeRoute = readRoute(routeId);
+
+  // Bind the current local repository as route context. This is metadata-only:
+  // it does not pull, push, commit, or contact GitHub. The planning brain can
+  // use the same branch/change evidence that Codex sees locally.
+  let workspace = null;
+  try {
+    const workspaceResult = await inspectGithubWorkspace({ cwd: args.cwd || process.cwd() });
+    workspace = compactWorkspaceBinding(workspaceResult);
+    if (workspace) {
+      activeRoute = updateRoute(routeId, { workspace, last_action: "github_workspace_auto_bind" });
+      appendRouteEvent(routeId, {
+        type: "WORKSPACE_AUTO_BOUND",
+        summary: `workspace auto-bound: ${workspace.name || workspace.root || "local repository"}`,
+        data: { github: workspace.github, branch: workspace.branch, changes: workspace.changes.length },
+      });
+    }
+  } catch {}
 
   activeBridgeLink = {
     state: "browser_selected",
@@ -2328,6 +2649,7 @@ async function bridgeConnect(args = {}) {
     session_id: sessionId,
     route_id: routeId,
     port: instance.port,
+    workspace,
   };
   const bridgeLink = activeBridgeLink;
   activeRelayEngine = createRelayEngine({
@@ -2357,6 +2679,7 @@ async function bridgeConnect(args = {}) {
         goal: roundArgs.goal,
         context: roundArgs.context,
         constraints: roundArgs.constraints,
+        workspace_state: workspacePromptState(workspace),
         continuous: config.mode === "continuous",
         max_rounds: config.mode === "continuous" ? undefined : config.rounds,
         port: instance.port,
@@ -2420,6 +2743,416 @@ async function bridgeConnect(args = {}) {
 
 function bridgeStatus() {
   return jsonResult("网页端连接状态", publicBridgeLink());
+}
+
+// Internal-only runtime facts used by the parent Swarm coordinator. This name
+// is intentionally absent from TOOLS, so ordinary users never receive route,
+// session, target, or port identifiers.
+function bridgeWorkerRuntimeStatus() {
+  return jsonResult("internal bridge worker runtime", {
+    available: Boolean(activeBridgeLink),
+    route_id: activeBridgeLink?.route_id || null,
+    session_id: activeBridgeLink?.session_id || activeSessionId || null,
+    port: activeBridgeLink?.port || null,
+    target_id: activeSession?.target_id || null,
+    provider: activeBridgeLink?.provider_id || null,
+    target_title: activeBridgeLink?.tab?.title || null,
+    target_url: activeBridgeLink?.tab?.url || null,
+  });
+}
+
+function swarmMemberConfig(raw = {}, cwd) {
+  const provider = raw.provider || raw.brain_provider || DEFAULT_BRAIN_PROVIDER;
+  const config = {
+    provider,
+    browser: raw.browser,
+    window: raw.window,
+    tab: raw.tab,
+    conversation: raw.conversation,
+    mode: raw.mode || "one_shot",
+    rounds: raw.rounds,
+    direction: raw.direction || "codex_to_web",
+    auto_launch: raw.auto_launch === true,
+    executor_provider: raw.executor_provider,
+    executor_model: raw.executor_model,
+    executor_profile: raw.executor_profile,
+    executor_endpoint: raw.executor_endpoint,
+    executor_agent: raw.executor_agent,
+    cwd,
+  };
+  return Object.fromEntries(Object.entries(config).filter(([, value]) => value !== undefined && value !== null && value !== ""));
+}
+
+function swarmLinkState(link) {
+  const state = String(link?.state || "preparing");
+  if (link?.run?.state === "running" || state === "running") return "running";
+  if (["paused", "disconnected", "worker_unavailable", "duplicate_target"].includes(state)) return state;
+  if (state === "waiting_for_login") return "waiting_for_login";
+  if (state === "awaiting_goal") return "awaiting_goal";
+  if (["connected", "ready"].includes(state)) return "ready";
+  return state;
+}
+
+function swarmWatchdogFailure(state) {
+  return [
+    "browser_unreachable",
+    "page_unresponsive",
+    "composer_missing",
+    "selector_degraded",
+    "generation_timeout",
+    "provider_tab_not_found",
+    "target_selection_required",
+    "watchdog_error",
+  ].includes(String(state || ""));
+}
+
+function swarmSafeMessage(value, fallback = "网页会话已暂停，需要人工检查原标签页") {
+  const message = String(value || fallback)
+    .replace(/\b(route|session|target|swarm|worker)[-_][A-Za-z0-9._-]+\b/gi, "$1-id")
+    .slice(0, 500);
+  return message || fallback;
+}
+
+function swarmPublicLink(result) {
+  const link = result?.structuredContent;
+  if (!link || typeof link !== "object") return null;
+  return {
+    state: link.state || "preparing",
+    connected: Boolean(link.connected),
+    provider: link.provider || null,
+    browser: link.browser || null,
+    window: link.window || null,
+    tab: link.tab || null,
+    conversation: link.conversation || null,
+    workspace: link.workspace || null,
+    mode: link.mode || null,
+    direction: link.direction || null,
+    rounds: link.rounds ?? null,
+    goal_status: link.goal_status || "none",
+    run: link.run ? {
+      state: link.run.state || null,
+      status: link.run.status || null,
+      round: link.run.round ?? 0,
+      started_at: link.run.started_at || null,
+      finished_at: link.run.finished_at || null,
+      error: link.run.error ? swarmSafeMessage(link.run.error) : null,
+    } : null,
+    browser_health: link.browser_health || null,
+  };
+}
+
+function swarmFailure(state, message) {
+  return {
+    state: String(state || "unknown"),
+    message: swarmSafeMessage(message),
+    at: new Date().toISOString(),
+  };
+}
+
+function swarmWorkerArgs(swarm, member, extra = {}) {
+  return {
+    ...(member.config || {}),
+    ...extra,
+    __host_codex_context: workerContextOf(swarm, member),
+  };
+}
+
+async function swarmWorkerCall(swarm, member, name, extra = {}, timeoutMs = 10 * 60 * 1000) {
+  if (IS_ROUTE_WORKER || !routeWorkerPool) throw new Error("网页会话组只能由 MCP 控制面运行");
+  return routeWorkerPool.call(name, swarmWorkerArgs(swarm, member, extra), { timeoutMs });
+}
+
+function swarmAggregateState(swarm) {
+  if (swarm.state === "stopped") return "stopped";
+  const states = (swarm.members || []).map(member => member.state);
+  if (!states.length) return "preparing";
+  if (states.some(state => ["paused", "failed", "worker_unavailable", "duplicate_target"].includes(state))) return "paused";
+  if (states.some(state => state === "running")) return "running";
+  if (states.every(state => state === "completed")) return "completed";
+  if (states.some(state => state === "waiting_for_login")) return "waiting_for_login";
+  if (states.some(state => state === "awaiting_goal")) return "awaiting_goal";
+  if (states.every(state => ["ready", "completed"].includes(state))) return "ready";
+  return "partial";
+}
+
+async function pauseSwarmMember(swarm, member, state, message) {
+  if (member.state !== "paused" || member.failure?.state !== state) {
+    try { await swarmWorkerCall(swarm, member, "bridge_pause", {}, 2 * 60 * 1000); } catch {}
+  }
+  member.state = "paused";
+  member.failure = swarmFailure(state, message);
+}
+
+async function startSwarmWatchdog(swarm, member) {
+  const runtime = member.runtime;
+  if (!runtime?.port) return;
+  const result = await swarmWorkerCall(swarm, member, "browser_watchdog_start", {
+    name: member.watchdog_name,
+    provider: member.config.provider || DEFAULT_BRAIN_PROVIDER,
+    port: runtime.port,
+    target_title: runtime.target_title || member.link?.tab?.title,
+    target_url: runtime.target_url || member.link?.tab?.url,
+    route_id: runtime.route_id,
+    interval_ms: swarm.watchdog?.interval_ms,
+    generation_timeout_ms: swarm.watchdog?.generation_timeout_ms,
+  }, 2 * 60 * 1000);
+  const watchdog = result?.structuredContent?.watchdog;
+  if (watchdog) member.watchdog = watchdog;
+  const healthState = watchdog?.last_result?.state || watchdog?.state;
+  if (swarmWatchdogFailure(healthState)) {
+    await pauseSwarmMember(swarm, member, healthState, watchdog?.last_alert?.message || watchdog?.last_result?.message || "网页守护检测失败");
+  }
+}
+
+async function connectSwarmMember(swarm, member, { resume = false } = {}) {
+  // A fresh route/session pair is used on every explicit recovery. If the
+  // worker is still alive, bridge_connect(resume) keeps its original target;
+  // if it restarted, the saved human selectors are used to reconnect the same
+  // target instead of silently selecting another one.
+  member.route_id = internalBridgeId("swarm-route");
+  member.session_id = internalBridgeId("swarm-session");
+  member.failure = null;
+  const result = await swarmWorkerCall(swarm, member, "bridge_connect", {
+    ...member.config,
+    resume: Boolean(resume),
+    __route_id: member.route_id,
+    __session_id: member.session_id,
+  }, 10 * 60 * 1000);
+  const link = swarmPublicLink(result);
+  if (link) member.link = link;
+  if (result?.isError) {
+    const state = link ? swarmLinkState(link) : "paused";
+    member.state = state === "waiting_for_login" ? state : "paused";
+    if (member.state === "paused") member.failure = swarmFailure(state, resultText(result));
+    return result;
+  }
+  member.state = swarmLinkState(link);
+  const runtimeResult = await swarmWorkerCall(swarm, member, "bridge_worker_runtime_status", {}, 60 * 1000);
+  const runtime = runtimeResult?.structuredContent;
+  if (!runtime?.available) {
+    await pauseSwarmMember(swarm, member, "worker_unavailable", "网页会话 worker 未返回运行状态");
+    return result;
+  }
+  member.runtime = runtime;
+  const duplicate = runtime.target_id && swarm.members.some(other => other !== member && other.runtime?.target_id === runtime.target_id);
+  if (duplicate) {
+    await pauseSwarmMember(swarm, member, "duplicate_target", "多个网页会话选择了同一个浏览器标签页；没有切换或重发消息");
+    return result;
+  }
+  try {
+    await startSwarmWatchdog(swarm, member);
+  } catch (error) {
+    await pauseSwarmMember(swarm, member, "watchdog_error", String(error));
+  }
+  return result;
+}
+
+async function syncSwarm(swarm) {
+  if (swarm.state === "stopped") return swarm;
+  for (const member of swarm.members || []) {
+    try {
+      const status = await swarmWorkerCall(swarm, member, "bridge_status", {}, 2 * 60 * 1000);
+      const link = swarmPublicLink(status);
+      if (link) member.link = link;
+      const watchdogResult = await swarmWorkerCall(swarm, member, "browser_watchdog_status", { name: member.watchdog_name }, 60 * 1000);
+      const watchdog = watchdogResult?.structuredContent?.watchdogs?.[0];
+      if (watchdog) member.watchdog = watchdog;
+      const healthState = watchdog?.last_result?.state || watchdog?.state || link?.browser_health?.state;
+      if (swarmWatchdogFailure(healthState) && member.state !== "paused") {
+        await pauseSwarmMember(swarm, member, healthState, watchdog?.last_alert?.message || watchdog?.last_result?.message || "网页守护检测失败");
+      } else if (member.state !== "paused" && member.state !== "duplicate_target") {
+        member.state = swarmLinkState(link);
+      }
+    } catch (error) {
+      if (member.state !== "paused") await pauseSwarmMember(swarm, member, "worker_unavailable", "网页会话 worker 不可用，已暂停整个会话组");
+      member.failure ||= swarmFailure("worker_unavailable", String(error));
+    }
+  }
+  swarm.state = swarmAggregateState(swarm);
+  return writeSwarm(swarm);
+}
+
+function resolveSwarm(name) {
+  const swarm = findSwarmByName(name);
+  if (!swarm) throw new Error(`没有找到网页会话组：${name}`);
+  return swarm;
+}
+
+function selectSwarmMembers(swarm, label) {
+  if (!String(label || "").trim()) return [...(swarm.members || [])];
+  const member = memberByLabel(swarm, label);
+  if (!member) throw new Error(`会话组“${swarm.name}”中没有找到网页会话：${label}`);
+  return [member];
+}
+
+async function bridgeSwarmCreate(args = {}) {
+  if (IS_ROUTE_WORKER || !routeWorkerPool) return jsonResult("网页会话组只能由 MCP 控制面创建", { created: false }, true);
+  const name = String(args.name || args.label || "").trim().slice(0, 100);
+  if (!name) return jsonResult("请提供网页会话组名称", { created: false }, true);
+  if (findSwarmByName(name)) return jsonResult(`网页会话组已存在：${name}`, { created: false }, true);
+  const members = Array.isArray(args.members) ? args.members : [];
+  if (!members.length) return jsonResult("请提供至少一个网页会话配置；先用 bridge_discover 查看浏览器和标签页", { created: false }, true);
+  if (members.length > maxMembers()) return jsonResult(`网页会话组最多支持 ${maxMembers()} 个会话`, { created: false }, true);
+  const cwd = args.cwd || process.cwd();
+  const workspaceResult = await inspectGithubWorkspace({ cwd });
+  if (!workspaceResult.ok) return jsonResult("网页会话组要求绑定一个可读取的本地 Git 工作区", { created: false, workspace: workspaceResult }, true);
+  const workspace = compactWorkspaceBinding(workspaceResult);
+  const group = newSwarmRecord({
+    id: internalBridgeId("swarm"),
+    name,
+    cwd,
+    workspace,
+    watchdog: {
+      interval_ms: Math.min(Math.max(Number(args.interval_ms) || 15000, 5000), 10 * 60 * 1000),
+      generation_timeout_ms: Math.min(Math.max(Number(args.generation_timeout_ms) || 180000, 15000), 30 * 60 * 1000),
+    },
+  });
+  const labels = new Set();
+  for (const [index, raw] of members.entries()) {
+    const label = String(raw?.label || raw?.name || `网页会话 ${index + 1}`).trim().slice(0, 80);
+    const key = label.toLocaleLowerCase();
+    if (labels.has(key)) return jsonResult(`网页会话组中存在重复名称：${label}`, { created: false }, true);
+    labels.add(key);
+    const config = swarmMemberConfig(raw, cwd);
+    const member = {
+      member_id: internalBridgeId("swarm-member"),
+      label,
+      config,
+      provider: config.provider,
+      browser: config.browser || null,
+      window: config.window || null,
+      tab: config.tab || null,
+      conversation: config.conversation || null,
+      mode: config.mode || null,
+      direction: config.direction || null,
+      rounds: config.rounds ?? null,
+      worker_context: internalBridgeId("swarm-worker"),
+      route_id: null,
+      session_id: null,
+      runtime: null,
+      watchdog_name: internalBridgeId("swarm-watchdog"),
+      watchdog: { lifecycle: "not_started", state: "unknown", checks: 0, alert_count: 0 },
+      link: null,
+      state: "preparing",
+      failure: null,
+    };
+    group.members.push(member);
+  }
+  writeSwarm(group);
+  for (const member of group.members) {
+    try {
+      await connectSwarmMember(group, member);
+    } catch (error) {
+      await pauseSwarmMember(group, member, "connect_failed", String(error));
+    }
+    group.state = swarmAggregateState(group);
+    writeSwarm(group);
+  }
+  group.state = swarmAggregateState(group);
+  writeSwarm(group);
+  appendSwarmEvent(group.swarm_id, { type: "SWARM_CREATED", summary: `created swarm ${group.name}` });
+  return jsonResult(`已创建网页会话组：${group.name}`, { created: true, swarm: publicSwarm(readSwarm(group.swarm_id)) });
+}
+
+async function bridgeSwarmStatus(args = {}) {
+  if (IS_ROUTE_WORKER || !routeWorkerPool) return jsonResult("网页会话组状态只能由 MCP 控制面读取", { swarms: [] }, true);
+  const wanted = String(args.name || args.label || "").trim();
+  if (!wanted) {
+    const swarms = await Promise.all(listSwarms().map(swarm => syncSwarm(swarm).catch(() => swarm)));
+    return jsonResult("网页会话组状态", { swarms: swarms.map(publicSwarm) });
+  }
+  try {
+    const swarm = await syncSwarm(resolveSwarm(wanted));
+    return jsonResult(`网页会话组：${swarm.name}`, { swarm: publicSwarm(swarm) }, false);
+  } catch (error) {
+    return jsonResult(String(error), { swarm: null }, true);
+  }
+}
+
+async function bridgeSwarmResume(args = {}) {
+  if (IS_ROUTE_WORKER || !routeWorkerPool) return jsonResult("网页会话组只能由 MCP 控制面恢复", { resumed: false }, true);
+  let swarm;
+  try { swarm = resolveSwarm(args.name || args.label); } catch (error) { return jsonResult(String(error), { resumed: false }, true); }
+  if (swarm.state === "stopped") return jsonResult("这个网页会话组已经停止，请创建新的会话组", { resumed: false, swarm: publicSwarm(swarm) }, true);
+  let selected;
+  try { selected = selectSwarmMembers(swarm, args.member); } catch (error) { return jsonResult(String(error), { resumed: false, swarm: publicSwarm(swarm) }, true); }
+  for (const member of selected) {
+    try {
+      await connectSwarmMember(swarm, member, { resume: true });
+    } catch (error) {
+      await pauseSwarmMember(swarm, member, "resume_failed", String(error));
+    }
+  }
+  swarm.state = swarmAggregateState(swarm);
+  writeSwarm(swarm);
+  appendSwarmEvent(swarm.swarm_id, { type: "SWARM_RESUMED", summary: `resumed ${args.member || "all members"}` });
+  return jsonResult(`网页会话组已尝试恢复：${swarm.name}`, { resumed: true, swarm: publicSwarm(readSwarm(swarm.swarm_id)) }, false);
+}
+
+async function bridgeSwarmPause(args = {}) {
+  if (IS_ROUTE_WORKER || !routeWorkerPool) return jsonResult("网页会话组只能由 MCP 控制面暂停", { paused: false }, true);
+  let swarm;
+  try { swarm = resolveSwarm(args.name || args.label); } catch (error) { return jsonResult(String(error), { paused: false }, true); }
+  let selected;
+  try { selected = selectSwarmMembers(swarm, args.member); } catch (error) { return jsonResult(String(error), { paused: false }, true); }
+  for (const member of selected) await pauseSwarmMember(swarm, member, "user_pause", args.reason || "用户暂停网页会话组");
+  swarm.state = "paused";
+  writeSwarm(swarm);
+  appendSwarmEvent(swarm.swarm_id, { type: "SWARM_PAUSED", summary: args.member ? `paused ${args.member}` : "paused all members" });
+  return jsonResult(`网页会话组已暂停：${swarm.name}`, { paused: true, swarm: publicSwarm(readSwarm(swarm.swarm_id)) });
+}
+
+async function bridgeSwarmRun(args = {}) {
+  if (IS_ROUTE_WORKER || !routeWorkerPool) return jsonResult("网页会话组只能由 MCP 控制面运行", { started: false }, true);
+  let swarm;
+  try { swarm = await syncSwarm(resolveSwarm(args.name || args.label)); } catch (error) { return jsonResult(String(error), { started: false }, true); }
+  if (swarm.state === "paused") return jsonResult("网页会话组中存在异常成员，已暂停；请先修复原标签页后明确恢复", { started: false, swarm: publicSwarm(swarm) }, true);
+  if (swarm.members.some(member => ["waiting_for_login", "preparing", "partial"].includes(member.state))) {
+    return jsonResult("网页会话组尚未全部连接；请完成登录或目标选择后恢复", { started: false, swarm: publicSwarm(swarm) }, true);
+  }
+  const goal = String(args.goal || args.answer || "").trim();
+  const selected = swarm.members.filter(member => ["ready", "awaiting_goal", "connected"].includes(member.state));
+  if (!selected.length) return jsonResult("没有可运行的网页会话", { started: false, swarm: publicSwarm(swarm) }, true);
+  const results = await Promise.all(selected.map(async member => {
+    if (goal) {
+      const goalResult = await swarmWorkerCall(swarm, member, "bridge_goal_create", { answer: goal }, 2 * 60 * 1000);
+      if (goalResult?.isError) return { member, ok: false, state: "goal_failed", result: goalResult };
+    } else if (member.link?.goal_status !== "attached") {
+      return { member, ok: false, state: "goal_required" };
+    }
+    const runResult = await swarmWorkerCall(swarm, member, "bridge_run", { wait: args.wait === true }, args.wait === true ? 30 * 60 * 1000 : 2 * 60 * 1000);
+    return { member, ok: !runResult?.isError, state: runResult?.structuredContent?.state || "running", result: runResult };
+  }));
+  for (const entry of results) {
+    if (entry.ok) entry.member.state = entry.state === "paused" ? "paused" : "running";
+    else await pauseSwarmMember(swarm, entry.member, entry.state, resultText(entry.result) || "网页会话运行失败");
+  }
+  swarm.state = swarmAggregateState(swarm);
+  writeSwarm(swarm);
+  appendSwarmEvent(swarm.swarm_id, { type: "SWARM_RUN", summary: `run requested for ${selected.length} members` });
+  if (args.wait === true) await syncSwarm(swarm);
+  return jsonResult(`网页会话组已启动：${swarm.name}`, {
+    started: results.some(entry => entry.ok),
+    members_started: results.filter(entry => entry.ok).length,
+    members_failed: results.filter(entry => !entry.ok).length,
+    swarm: publicSwarm(readSwarm(swarm.swarm_id)),
+  }, results.every(entry => !entry.ok));
+}
+
+async function bridgeSwarmStop(args = {}) {
+  if (IS_ROUTE_WORKER || !routeWorkerPool) return jsonResult("网页会话组只能由 MCP 控制面停止", { stopped: false }, true);
+  let swarm;
+  try { swarm = resolveSwarm(args.name || args.label); } catch (error) { return jsonResult(String(error), { stopped: false }, true); }
+  for (const member of swarm.members || []) {
+    try { await swarmWorkerCall(swarm, member, "browser_watchdog_stop", { name: member.watchdog_name }, 60 * 1000); } catch {}
+    try { await swarmWorkerCall(swarm, member, "bridge_disconnect", {}, 2 * 60 * 1000); } catch {}
+    member.state = "stopped";
+  }
+  swarm.state = "stopped";
+  swarm.stop_reason = args.reason || "用户停止网页会话组";
+  writeSwarm(swarm);
+  appendSwarmEvent(swarm.swarm_id, { type: "SWARM_STOPPED", summary: swarm.stop_reason });
+  return jsonResult(`网页会话组已停止：${swarm.name}`, { stopped: true, swarm: publicSwarm(readSwarm(swarm.swarm_id)) });
 }
 
 async function bridgeGoalCreate(args = {}) {
@@ -3215,8 +3948,10 @@ const TOOLS = [
       tab: { type: "string", description: "Visible tab title or exact URL." },
       target_title: { type: "string" },
       target_url: { type: "string" },
+      route_id: { type: "string", description: "Optional bridge route to receive durable health-alert events." },
       interval_ms: { type: "integer", minimum: 5000, maximum: 600000, default: 15000 },
       timeout_ms: { type: "integer", minimum: 500, maximum: 15000, default: 3500 },
+      generation_timeout_ms: { type: "integer", minimum: 15000, maximum: 1800000, default: 180000 },
     } },
   },
   {
@@ -3233,6 +3968,111 @@ const TOOLS = [
     name: "github_workspace_status",
     description: "Inspect the current local Git/GitHub workspace: repository root, branch, upstream, remotes, ahead/behind counts, and changed files. This toolkit is read-only and never pulls, pushes, commits, or contacts GitHub.",
     inputSchema: { type: "object", properties: { cwd: { type: "string", description: "Optional local workspace path. Defaults to the current Codex workspace." } } },
+  },
+  {
+    name: "github_workspace_bind",
+    description: "Bind the current local Git/GitHub workspace summary to an existing route. This only stores branch/remotes/change context; it never pulls, pushes, commits, or contacts GitHub.",
+    inputSchema: { type: "object", properties: {
+      route_id: { type: "string" },
+      cwd: { type: "string", description: "Optional local workspace path. Defaults to the current Codex workspace." },
+    }, required: ["route_id"] },
+  },
+  {
+    name: "bridge_host_status",
+    description: "Report MCP host compatibility and safety boundaries. DevSpace is only generic stdio MCP compatible until a dedicated adapter is implemented; ChatGPT Web is a bridged web peer, not a local MCP host.",
+    inputSchema: { type: "object", properties: {
+      host: { type: "string", enum: ["generic", "codex", "opencode", "devspace", "chatgpt_web"], default: "generic", description: "Host to inspect. Defaults to the generic stdio MCP contract." },
+    } },
+  },
+  {
+    name: "artifact_workspace_status",
+    description: "Read-only scan of the selected local workspace for Word, PowerPoint, PDF, Markdown, text, CSV, and spreadsheet files. Returns filenames and metadata only; it does not read document bodies, upload files, or log in to Notion.",
+    inputSchema: { type: "object", properties: {
+      cwd: { type: "string", description: "Optional local workspace path. Defaults to the current Codex workspace." },
+      max_depth: { type: "integer", minimum: 0, maximum: 8, default: 4 },
+      max_files: { type: "integer", minimum: 1, maximum: 500, default: 200 },
+    } },
+  },
+  {
+    name: "artifact_workspace_read",
+    description: "Read bounded UTF-8 content only from explicitly selected files inside a local workspace. Markdown, text, and CSV are supported; Word/PPT/PDF return metadata-only capability notices. Never reads the whole workspace, uploads files, or logs in to Notion.",
+    inputSchema: { type: "object", properties: {
+      cwd: { type: "string", description: "Optional local workspace path. Defaults to the current Codex workspace." },
+      files: { type: "array", minItems: 1, maxItems: 20, items: { type: "string" }, description: "Relative paths returned by artifact_workspace_status. Explicit selection is required." },
+      max_total_chars: { type: "integer", minimum: 1000, maximum: 50000, default: 20000 },
+      max_file_chars: { type: "integer", minimum: 500, maximum: 20000, default: 8000 },
+    }, required: ["files"] },
+  },
+  {
+    name: "bridge_swarm_list",
+    description: "List persisted multi-web-session groups by human-readable names and aggregate safety status. Internal worker, route, session, target, and port identifiers are never returned.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "bridge_swarm_create",
+    description: "Create and connect a multi-web-session group. Each member gets its own MCP worker, exact visible browser target, and read-only browser watchdog while sharing one local Git workspace context. It never silently changes tabs or resends prompts.",
+    inputSchema: { type: "object", properties: {
+      name: { type: "string", description: "Human-readable group name, such as 论文多模型组." },
+      cwd: { type: "string", description: "Local Git workspace to bind read-only to every member. Defaults to the current workspace." },
+      members: { type: "array", minItems: 1, maxItems: 32, description: "One object per already-open visible web conversation. Run bridge_discover first and use human browser/window/tab/conversation choices.", items: { type: "object", properties: {
+        label: { type: "string" },
+        provider: { type: "string", enum: listBrainProviders().map(provider => provider.id), default: DEFAULT_BRAIN_PROVIDER },
+        browser: { type: "string" },
+        window: { type: "string" },
+        tab: { type: "string" },
+        conversation: { type: "string" },
+        mode: { type: "string", enum: ["one_shot", "bounded", "continuous"], default: "one_shot" },
+        rounds: { type: "integer", minimum: 0, maximum: 50, default: 1 },
+        direction: { type: "string", enum: ["codex_to_web", "web_to_codex"], default: "codex_to_web" },
+        auto_launch: { type: "boolean", default: false, description: "Swarm defaults to false to avoid opening replacement browser sessions; enable only explicitly." },
+        executor_provider: executorProviderSchema(),
+        executor_model: executorModelSchema(),
+        executor_profile: executorProfileSchema(),
+        executor_endpoint: executorEndpointSchema(),
+        executor_agent: executorAgentSchema(),
+      } } },
+      interval_ms: { type: "integer", minimum: 5000, maximum: 600000, default: 15000 },
+      generation_timeout_ms: { type: "integer", minimum: 15000, maximum: 1800000, default: 180000 },
+    }, required: ["name", "members"] },
+  },
+  {
+    name: "bridge_swarm_status",
+    description: "Refresh and aggregate the health of one multi-web-session group, including member states, independent watchdog alerts, runs, duplicate targets, and the shared local workspace. A failure leaves the group paused.",
+    inputSchema: { type: "object", properties: { name: { type: "string", description: "Human-readable group name. Omit to list all groups." } } },
+  },
+  {
+    name: "bridge_swarm_resume",
+    description: "Explicitly retry the original browser target for a paused or waiting swarm member after the user fixes the visible page. It never selects a replacement tab or resends a prompt.",
+    inputSchema: { type: "object", properties: {
+      name: { type: "string", description: "Human-readable group name." },
+      member: { type: "string", description: "Optional human-readable member label; omit to retry every member." },
+    }, required: ["name"] },
+  },
+  {
+    name: "bridge_swarm_run",
+    description: "Run the same explicit goal across every ready member in parallel. A goal is compiled separately in each worker; any member failure pauses that member and the whole group without retrying or switching destinations.",
+    inputSchema: { type: "object", properties: {
+      name: { type: "string", description: "Human-readable group name." },
+      goal: { type: "string", description: "The goal to attach to each member. Omit only when every member already has an attached goal." },
+      wait: { type: "boolean", default: false, description: "Wait for all selected member runs to finish. Defaults to background start." },
+    }, required: ["name"] },
+  },
+  {
+    name: "bridge_swarm_pause",
+    description: "Pause one member or the whole group. Pausing never closes tabs, switches destinations, or resends messages.",
+    inputSchema: { type: "object", properties: {
+      name: { type: "string", description: "Human-readable group name." },
+      member: { type: "string", description: "Optional human-readable member label; omit to pause every member." },
+      reason: { type: "string" },
+    }, required: ["name"] },
+  },
+  {
+    name: "bridge_swarm_stop",
+    description: "Stop a group explicitly, stopping its watchdogs and disconnecting its member links. It never deletes files or opens replacement browser sessions.",
+    inputSchema: { type: "object", properties: {
+      name: { type: "string", description: "Human-readable group name." },
+      reason: { type: "string" },
+    }, required: ["name"] },
   },
   {
     name: "bridge_discover",
@@ -3257,10 +4097,13 @@ const TOOLS = [
       goal: { type: "string", description: "Internal compiled bridge goal created from the user's answer after connection. The user should not enter a goal in the panel." },
       goal_source: { type: "string", enum: ["plugin_question", "codex_conversation", "explicit"], default: "plugin_question", description: "The goal source. By default the bridge asks the user for a goal after connection and compiles the answer." },
       auto_launch: { type: "boolean", default: true, description: "Automatically start the dedicated persistent Edge profile when no debuggable browser is available." },
+      cwd: { type: "string", description: "Optional local workspace to bind as read-only GitHub context for this link." },
       resume: { type: "boolean", description: "Re-check the current pending browser connection after the user finishes login or page preparation." },
       executor_provider: executorProviderSchema({ includeDefault: true }),
       executor_model: executorModelSchema(),
       executor_profile: executorProfileSchema(),
+      executor_endpoint: executorEndpointSchema(),
+      executor_agent: executorAgentSchema(),
     } },
   },
   {
@@ -3308,6 +4151,8 @@ const TOOLS = [
       executor_provider: executorProviderSchema(),
       executor_model: executorModelSchema(),
       executor_profile: executorProfileSchema(),
+      executor_endpoint: executorEndpointSchema(),
+      executor_agent: executorAgentSchema(),
       timeout_ms: { type: "integer", default: 120000 },
       safety_limit: { type: "integer", minimum: 1, maximum: 10000, default: 1000 },
       wait: { type: "boolean", default: false, description: "Wait for the whole run only when explicitly requested; the default is background execution so Codex remains usable." },
@@ -3336,7 +4181,7 @@ const TOOLS = [
   },
   {
     name: "bridge_route_create",
-    description: "Create a lightweight Control Plane route that maps one executor thread to one selected web brain session/tab. The Codex Adapter can drive the bound thread through App Server.",
+    description: "Create a lightweight Control Plane route that maps one local executor host session to one selected web brain session/tab. Codex uses App Server; OpenCode uses its documented local HTTP server.",
     inputSchema: { type: "object", properties: {
       route_id: { type: "string", description: "Stable route key, for example pokemon-rl." },
       name: { type: "string" },
@@ -3344,6 +4189,8 @@ const TOOLS = [
       executor_provider: executorProviderSchema({ includeDefault: true }),
       executor_model: executorModelSchema(),
       executor_profile: executorProfileSchema(),
+      executor_endpoint: executorEndpointSchema(),
+      executor_agent: executorAgentSchema(),
       codex_thread_id: { type: "string", description: "Optional Codex Thread ID for Control Plane metadata." },
       session_id: { type: "string", description: "Web brain bridge session to bind to this route." },
     }, required: ["route_id"] },
@@ -3360,7 +4207,7 @@ const TOOLS = [
   },
   {
     name: "bridge_route_bind",
-    description: "Bind or update a route's Codex thread, web brain provider/session, target tab, and conversation metadata.",
+    description: "Bind or update a route's local executor session, web brain provider/session, target tab, and conversation metadata.",
     inputSchema: { type: "object", properties: {
       route_id: { type: "string" },
       name: { type: "string" },
@@ -3368,6 +4215,8 @@ const TOOLS = [
       executor_provider: executorProviderSchema(),
       executor_model: executorModelSchema(),
       executor_profile: executorProfileSchema(),
+      executor_endpoint: executorEndpointSchema(),
+      executor_agent: executorAgentSchema(),
       codex_thread_id: { type: "string" },
       session_id: { type: "string" },
       target_id: { type: "string" },
@@ -3398,12 +4247,12 @@ const TOOLS = [
   },
   {
     name: "codex_adapter_status",
-    description: "Inspect the Codex Adapter and route worker state without starting a Codex process.",
+    description: "Inspect the selected local executor host adapter and route worker state without starting a process.",
     inputSchema: { type: "object", properties: { route_id: { type: "string" } } },
   },
   {
     name: "codex_thread_start",
-    description: "Start or resume the Codex App Server worker for a route and bind its real thread id to the Control Plane.",
+    description: "Start or resume the selected executor host session for a route. Codex uses App Server; OpenCode uses an existing opencode serve endpoint.",
     inputSchema: { type: "object", properties: {
       route_id: { type: "string" },
       codex_thread_id: { type: "string" },
@@ -3413,12 +4262,14 @@ const TOOLS = [
       executor_model: executorModelSchema(),
       executor_profile: executorProfileSchema(),
       base_instructions: { type: "string" },
+      executor_endpoint: executorEndpointSchema(),
+      executor_agent: executorAgentSchema(),
       approval_policy: { type: "string" },
     }, required: ["route_id"] },
   },
   {
     name: "codex_thread_turn",
-    description: "Send an explicit task to the Codex worker bound to a route and return its completed turn when available.",
+    description: "Send an explicit task to the local executor session bound to a route and return its completed result when available.",
     inputSchema: { type: "object", properties: {
       route_id: { type: "string" },
       codex_thread_id: { type: "string" },
@@ -3432,18 +4283,22 @@ const TOOLS = [
       executor_model: executorModelSchema(),
       executor_profile: executorProfileSchema(),
       effort: { type: "string" },
+      executor_endpoint: executorEndpointSchema(),
+      executor_agent: executorAgentSchema(),
       timeout_ms: { type: "integer", default: 120000 },
     }, required: ["route_id"] },
   },
   {
     name: "codex_thread_read",
-    description: "Read the metadata for the Codex thread bound to a route through the App Server protocol.",
+    description: "Read the metadata/messages for the selected executor session bound to a route.",
     inputSchema: { type: "object", properties: {
       route_id: { type: "string" },
       codex_thread_id: { type: "string" },
       executor_provider: executorProviderSchema(),
       executor_model: executorModelSchema(),
       executor_profile: executorProfileSchema(),
+      executor_endpoint: executorEndpointSchema(),
+      executor_agent: executorAgentSchema(),
     }, required: ["route_id"] },
   },
   {
@@ -3593,6 +4448,8 @@ const TOOLS = [
       executor_model: executorModelSchema(),
       executor_profile: executorProfileSchema(),
       effort: { type: "string" },
+      executor_endpoint: executorEndpointSchema(),
+      executor_agent: executorAgentSchema(),
       timeout_ms: { type: "integer", default: 120000 },
       safety_limit: { type: "integer", minimum: 1, maximum: 10000, default: 1000 },
       port: { type: "integer", default: DEFAULT_PORT },
@@ -3614,6 +4471,8 @@ const TOOLS = [
       executor_model: executorModelSchema(),
       executor_profile: executorProfileSchema(),
       effort: { type: "string" },
+      executor_endpoint: executorEndpointSchema(),
+      executor_agent: executorAgentSchema(),
       timeout_ms: { type: "integer", default: 120000 },
       safety_limit: { type: "integer", minimum: 1, maximum: 10000, default: 1000 },
       port: { type: "integer", default: DEFAULT_PORT },
@@ -3667,8 +4526,9 @@ for (const [alias, sourceName] of BRAIN_TOOL_ALIASES) {
 }
 
 const PUBLIC_BRIDGE_TOOLS = new Set(["bridge_discover", "bridge_connect", "bridge_goal_create", "bridge_status", "bridge_focus", "bridge_send", "bridge_receive", "bridge_run", "bridge_pause", "bridge_disconnect", "bridge_panel"]);
+const CONTEXT_ONLY_TOOLS = new Set(["bridge_host_status", "artifact_workspace_status", "artifact_workspace_read", "bridge_swarm_list", "bridge_swarm_create", "bridge_swarm_status", "bridge_swarm_resume", "bridge_swarm_run", "bridge_swarm_pause", "bridge_swarm_stop"]);
 for (const tool of TOOLS) {
-  if (!tool.inputSchema?.properties || PUBLIC_BRIDGE_TOOLS.has(tool.name) || tool.name === "brain_provider_list" || tool.name === "executor_provider_list" || tool.name.includes("session_") || tool.name.startsWith("bridge_route_")) continue;
+  if (!tool.inputSchema?.properties || PUBLIC_BRIDGE_TOOLS.has(tool.name) || CONTEXT_ONLY_TOOLS.has(tool.name) || tool.name === "brain_provider_list" || tool.name === "executor_provider_list" || tool.name.includes("session_") || tool.name.startsWith("bridge_route_")) continue;
   tool.inputSchema.properties.session_id = {
     type: "string",
     default: DEFAULT_SESSION_ID,
@@ -3707,6 +4567,22 @@ const ROUTED_TOOLS = new Set([
   "codex_thread_read",
 ]);
 
+// Public bridge state must not live in the parent MCP process. A separate
+// worker owns the CDP socket, selected tab, relay engine, and Codex adapter for
+// one host Codex conversation. This is what makes independent A/B/C tasks
+// safe to run in parallel instead of merely persisting several route files.
+const ROUTE_WORKER_TOOLS = new Set([
+  "bridge_connect",
+  "bridge_goal_create",
+  "bridge_status",
+  "bridge_send",
+  "bridge_receive",
+  "bridge_run",
+  "bridge_pause",
+  "bridge_disconnect",
+  "bridge_panel",
+]);
+
 async function callToolDirect(name, args) {
   if (name === "bridge_toolkit_list") return toolkitCatalog();
   if (name === "bridge_toolkit_status") return toolkitStatus();
@@ -3716,10 +4592,21 @@ async function callToolDirect(name, args) {
   if (name === "browser_watchdog_status") return browserWatchdogStatus(args);
   if (name === "browser_watchdog_stop") return browserWatchdogStop(args);
   if (name === "github_workspace_status") return githubWorkspaceStatus(args);
+  if (name === "github_workspace_bind") return bindGithubWorkspace(args);
+  if (name === "bridge_host_status") return bridgeHostStatus(args);
+  if (name === "artifact_workspace_status") return artifactWorkspaceStatus(args);
+  if (name === "artifact_workspace_read") return artifactWorkspaceRead(args);
+  if (name === "bridge_swarm_list" || name === "bridge_swarm_status") return bridgeSwarmStatus(args);
+  if (name === "bridge_swarm_create") return bridgeSwarmCreate(args);
+  if (name === "bridge_swarm_resume") return bridgeSwarmResume(args);
+  if (name === "bridge_swarm_run") return bridgeSwarmRun(args);
+  if (name === "bridge_swarm_pause") return bridgeSwarmPause(args);
+  if (name === "bridge_swarm_stop") return bridgeSwarmStop(args);
   if (name === "bridge_discover") return bridgeDiscover(args);
   if (name === "bridge_connect") return bridgeConnect(args);
   if (name === "bridge_goal_create") return bridgeGoalCreate(args);
   if (name === "bridge_status") return bridgeStatus(args);
+  if (name === "bridge_worker_runtime_status") return bridgeWorkerRuntimeStatus();
   if (name === "bridge_focus") return bridgeFocus(args);
   if (name === "bridge_send") return bridgeSend(args);
   if (name === "bridge_receive") return bridgeReceive(args);
@@ -3762,6 +4649,13 @@ async function callToolDirect(name, args) {
 }
 
 async function callTool(name, args) {
+  if (!IS_ROUTE_WORKER && routeWorkerPool && ROUTE_WORKER_TOOLS.has(name)) {
+    try {
+      return await routeWorkerPool.call(name, args, { timeoutMs: args.wait === true ? 30 * 60 * 1000 : 10 * 60 * 1000 });
+    } catch (error) {
+      return jsonResult(String(error), { state: "worker_unavailable", parallel_execution: true }, true);
+    }
+  }
   if (!ROUTED_TOOLS.has(name)) return callToolDirect(name, args);
   let routeId;
   try { routeId = routeIdOf(args); }

@@ -55,6 +55,18 @@ test("route metadata preserves the selected brain and executor providers", () =>
   assert.equal(summary.executor_profile, "my-deepseek");
 });
 
+test("route metadata preserves the OpenCode host endpoint and agent", () => {
+  resetRoute("opencode-route", {
+    executor_provider: "opencode",
+    executor_endpoint: "http://127.0.0.1:4096",
+    executor_agent: "build",
+  });
+  const summary = controlPlane.routeSummary(readRoute("opencode-route"));
+  assert.equal(summary.executor_provider, "opencode");
+  assert.equal(summary.executor_endpoint, "http://127.0.0.1:4096");
+  assert.equal(summary.executor_agent, "build");
+});
+
 test("route metadata preserves the Codex conversation binding source", () => {
   resetRoute("visible-codex-route", {
     codex_thread_id: "visible-thread",
@@ -69,6 +81,17 @@ test("route metadata preserves the Codex conversation binding source", () => {
   assert.equal(summary.codex_thread_id, "visible-thread");
   assert.equal(summary.codex_binding.source, "current_codex_conversation");
   assert.equal(summary.codex_binding.verified, true);
+});
+
+test("route metadata preserves read-only workspace and browser health context", () => {
+  resetRoute("context-route", {
+    workspace: { name: "demo-repo", github: true, branch: "main", changes: [] },
+    browser_health: { state: "page_unresponsive", message: "tab stopped responding" },
+  });
+  const summary = controlPlane.routeSummary(readRoute("context-route"));
+  assert.equal(summary.workspace.name, "demo-repo");
+  assert.equal(summary.workspace.github, true);
+  assert.equal(summary.browser_health.state, "page_unresponsive");
 });
 
 test("route status reports whether serialization is cross-process", () => {

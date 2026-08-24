@@ -2,7 +2,7 @@
   "mcpServers": {
     "chatgptWebBridge": {
       "title": "Codex Bridge Toolkit Series",
-      "description": "Visible Web LLM bridge, browser watchdog, multi-link status, and read-only GitHub workspace diagnostics.",
+      "description": "Parallel visible Web LLM bridge workers for Codex and OpenCode, browser health events, read-only GitHub workspace binding, explicit local artifact context, and fail-closed multi-web-session swarms.",
       "cwd": ".",
       "command": "node",
       "args": [
