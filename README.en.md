@@ -4,6 +4,8 @@
 
 **Language: [中文（默认）](README.md) · English**
 
+**GitHub:** [hccccc01333/codex-bridge-toolkit](https://github.com/hccccc01333/codex-bridge-toolkit)
+
 ![Node.js](https://img.shields.io/badge/Node.js-ESM-339933?logo=node.js&logoColor=white)
 ![MCP](https://img.shields.io/badge/MCP-enabled-6f42c1)
 ![Browser](https://img.shields.io/badge/Chrome%20%2F%20Edge-visible%20CDP-4285F4?logo=googlechrome&logoColor=white)
