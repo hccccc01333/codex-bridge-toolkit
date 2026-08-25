@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { compileOutboundWebTask, formatRelayMessage, sanitizeOutboundWebTask } from "../src/bridge/web_task_prompt.mjs";
+import { compileOutboundWebTask, formatRelayMessage, MAX_RELAY_CONTENT_CHARS, sanitizeOutboundWebTask } from "../src/bridge/web_task_prompt.mjs";
 
 test("outbound messages use only the transparent relay envelope", () => {
   const legacy = [
@@ -45,4 +45,12 @@ test("web replies have a matching envelope and keep prompt fields separate", () 
   assert.equal(message.user_prompt, "");
   assert.match(message.formatted_content, /【原完整内容】\n研究矩阵已完成/);
   assert.doesNotMatch(message.formatted_content, /【用户自己的提示词】/);
+});
+
+test("relay content is lossless up to the explicit safety limit", () => {
+  const content = "原始内容".repeat(12000);
+  const formatted = formatRelayMessage({ content, sourceTitle: "长任务" }).formatted_content;
+  assert.match(formatted, new RegExp(content));
+  assert.equal(formatted.includes("Bridge payload clipped"), false);
+  assert.ok(content.length < MAX_RELAY_CONTENT_CHARS);
 });

@@ -4,6 +4,7 @@ import {
   WEB_PROMPT_MAX_CHARS,
   compactWebPrompt,
   createReplyTracker,
+  isLikelyIncompleteReply,
   observeReply,
 } from "../src/bridge/web_reply_tracker.mjs";
 
@@ -27,6 +28,16 @@ test("reply tracker does not treat a thinking placeholder as a completed reply",
   const state = observeReply(tracker, { assistant_messages: [{ id: "new", text: "正在思考" }], generating: false }, 3000);
   assert.equal(state.done, false);
   assert.equal(state.status, "placeholder");
+});
+
+test("reply tracker refuses a stable fragment that ends mid-sentence", () => {
+  const tracker = createReplyTracker({}, { stablePollsRequired: 2, minStableMs: 0, now: 0 });
+  const snapshot = { assistant_messages: [{ id: "new", text: "这说明 Codex 依" }], generating: false };
+  assert.equal(isLikelyIncompleteReply(snapshot.assistant_messages[0].text), true);
+  assert.equal(observeReply(tracker, snapshot, 3000).done, false);
+  const second = observeReply(tracker, snapshot, 4000);
+  assert.equal(second.done, false);
+  assert.equal(second.status, "candidate_incomplete");
 });
 
 test("web prompts are bounded with head and tail preserved", () => {

@@ -1,9 +1,19 @@
-const MAX_TASK_CHARS = 24000;
+export const MAX_RELAY_CONTENT_CHARS = 100000;
 const MAX_USER_PROMPT_CHARS = 8000;
 
-function clip(value, limit = MAX_TASK_CHARS) {
+function clip(value, limit = 240) {
   const text = String(value ?? "").trim();
   return text.length <= limit ? text : `${text.slice(0, limit)}\n...[truncated]`;
+}
+
+function preserve(value, label, limit = MAX_RELAY_CONTENT_CHARS) {
+  const text = String(value ?? "").trim();
+  if (text.length > limit) {
+    const error = new Error(`${label} exceeds ${limit} characters; refusing to compress or send incomplete content`);
+    error.code = "RELAY_CONTENT_TOO_LARGE";
+    throw error;
+  }
+  return text;
 }
 
 function stripLegacyRelayWrapper(value) {
@@ -44,7 +54,7 @@ export function compileOutboundWebTask({ task, provider = "", sourceTitle = "", 
 }
 
 export function sanitizeOutboundWebTask(value) {
-  return clip(stripLegacyRelayWrapper(value));
+  return preserve(stripLegacyRelayWrapper(value), "relay content");
 }
 
 function sourceLine({ direction, sourceTitle = "", provider = "" } = {}) {
@@ -67,8 +77,8 @@ export function formatRelayMessage({
   userPrompt = "",
 } = {}) {
   const normalizedDirection = direction === "web_to_codex" ? "web_to_codex" : "codex_to_web";
-  const originalContent = clip(stripLegacyRelayWrapper(content));
-  const optionalPrompt = clip(userPrompt, MAX_USER_PROMPT_CHARS);
+  const originalContent = preserve(stripLegacyRelayWrapper(content), "relay content");
+  const optionalPrompt = preserve(userPrompt, "user prompt", MAX_USER_PROMPT_CHARS);
   const marker = normalizedDirection === "web_to_codex"
     ? "【网页端 → Codex 搬运】"
     : "【Codex → 网页端】";

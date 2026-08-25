@@ -1,6 +1,8 @@
 const DEFAULT_STABLE_POLLS = 5;
 const DEFAULT_MIN_STABLE_MS = 1800;
 const PLACEHOLDER_RE = /^(正在思考|思考中|生成中|generating|thinking|loading)\.{0,3}$/i;
+const INCOMPLETE_TAIL_RE = /(?:\.\.\.|……|[，,、：:；;]|依|因|所|对|与|和|及|但|而|或|为|以|将|在|从|把|于|被)$/u;
+const INCOMPLETE_ENGLISH_TAIL_RE = /\b(?:and|or|but|because|therefore|with|without|for|from|to|of|in|on|at|by|as|that|which|the|a|an)$/i;
 
 function text(value) {
   return String(value ?? "").trim();
@@ -19,6 +21,12 @@ function normalizeMessages(snapshot = {}) {
       text: text(message?.text ?? message),
     }))
     .filter(message => message.text);
+}
+
+export function isLikelyIncompleteReply(value) {
+  const candidate = text(value);
+  if (!candidate) return true;
+  return INCOMPLETE_TAIL_RE.test(candidate) || INCOMPLETE_ENGLISH_TAIL_RE.test(candidate);
 }
 
 export function createReplyTracker(before = {}, {
@@ -61,15 +69,18 @@ export function observeReply(tracker, snapshot = {}, now = Date.now()) {
   }
 
   const placeholder = PLACEHOLDER_RE.test(candidate.text);
+  const likelyIncomplete = isLikelyIncompleteReply(candidate.text);
   const stableLongEnough = now - tracker.submittedAt >= tracker.minStableMs;
   const done = !snapshot.generating
     && !placeholder
+    && !likelyIncomplete
     && stableLongEnough
     && tracker.stablePolls >= tracker.stablePollsRequired;
   return {
     done,
-    status: done ? "completed" : placeholder ? "placeholder" : "stabilizing",
+    status: done ? "completed" : placeholder ? "placeholder" : likelyIncomplete ? "candidate_incomplete" : "stabilizing",
     generating: Boolean(snapshot.generating),
+    likely_incomplete: likelyIncomplete,
     candidate,
     stablePolls: tracker.stablePolls,
     messages,

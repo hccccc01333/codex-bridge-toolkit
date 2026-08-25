@@ -32,6 +32,10 @@ test("web sends use a same-tab delivery guard and do not return an unstable prev
   assert.match(serverSource, /createReplyTracker\(before/);
   assert.match(serverSource, /observeReply\(tracker, state, Date\.now\(\)\)/);
   assert.doesNotMatch(serverSource, /last: previous/);
+  assert.match(serverSource, /args\.relay_message\s*\?/);
+  assert.doesNotMatch(serverSource, /raw\.length > 20000/);
+  assert.match(serverSource, /CODEX_SOURCE_CONTENT_TOO_LARGE/);
+  assert.doesNotMatch(serverSource, /sourceText = clip\(collectCodexSourceText/);
 });
 
 test("web send failures pause the relay and block automatic waiting reads", () => {

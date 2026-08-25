@@ -144,7 +144,9 @@ When a web reply returns to Codex, it uses the matching marker:
 The complete web reply
 ```
 
-Original content, the optional user prompt, and the rendered message are stored separately in the local delivery ledger. Use `user_prompt` in `bridge_send` only when the user explicitly supplies an addition; it defaults to empty.
+Original content, the optional user prompt, and the rendered message are stored separately in the local delivery ledger. Bridge messages are lossless up to the explicit 100,000-character safety limit; there is no silent head/tail compression. Above that limit the bridge fails closed and asks the user to split the message. Use `user_prompt` in `bridge_send` only when the user explicitly supplies an addition; it defaults to empty.
+
+Normal relaying must use the public `bridge_connect`, `bridge_send`, and `bridge_receive` flow, even when the user provides a fixed web URL or fixed Codex URL. Do not replace it with an ad-hoc WebSocket, CDP, or DOM script; those paths cannot provide the bridge's completeness, deduplication, and fail-closed guarantees.
 
 ## OpenCode setup
 

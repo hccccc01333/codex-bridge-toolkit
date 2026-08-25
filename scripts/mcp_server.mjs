@@ -1467,8 +1467,10 @@ async function codexThreadRead(args = {}) {
   }
 }
 
+const CODEX_SOURCE_MAX_CHARS = 100000;
+
 function collectCodexSourceText(value, chunks = [], seen = new Set(), depth = 0) {
-  if (value === null || value === undefined || depth > 10 || chunks.join("\n").length >= 24000) return chunks;
+  if (value === null || value === undefined || depth > 10) return chunks;
   if (typeof value === "string") {
     if (value.trim()) chunks.push(value.trim());
     return chunks;
@@ -1502,15 +1504,28 @@ async function codexSourceThreadRead(args = {}) {
       args: codexLaunchArgs(provider, model, profile),
     });
     const result = await adapter.readThread(threadId);
-    const maxChars = Math.min(24000, Math.max(1000, Number(args.max_chars) || 12000));
-    const sourceText = clip(collectCodexSourceText(result).join("\n\n"), maxChars);
+    const maxChars = Math.min(CODEX_SOURCE_MAX_CHARS, Math.max(1000, Number(args.max_chars) || CODEX_SOURCE_MAX_CHARS));
+    const sourceText = collectCodexSourceText(result).join("\n\n");
+    if (sourceText.length > maxChars) {
+      return jsonResult(`指定 Codex 对话内容超过 ${maxChars} 字符安全上限；未截断、未转发，请拆分任务后重试`, {
+        read: false,
+        source: "explicit_codex_thread",
+        thread_url: threadUrl,
+        thread_id: threadId,
+        code: "CODEX_SOURCE_CONTENT_TOO_LARGE",
+        content_length: sourceText.length,
+        max_chars: maxChars,
+        truncated: false,
+      }, true);
+    }
     return jsonResult(`已只读读取指定 Codex 对话：${threadId}`, {
       read: true,
       source: "explicit_codex_thread",
       thread_url: threadUrl,
       thread_id: threadId,
       text: sourceText,
-      truncated: sourceText.endsWith("...[truncated]"),
+      truncated: false,
+      content_length: sourceText.length,
       note: "这是其他 Codex 对话的只读内容；不会把它绑定为当前 Codex Worker，也不会自动执行或转发。",
     });
   } catch (error) {
@@ -3798,9 +3813,8 @@ async function pageSnapshot(provider = brainProviderOf()) {
         || node.id
         || '';
       const id = explicitId || ('assistant-' + index);
-      const raw = (node.innerText || '').trim();
-      const text = raw.length > 20000 ? raw.slice(0, 12000) + '\\n...[message clipped]\\n' + raw.slice(-7000) : raw;
-      return { id, text };
+      const text = (node.innerText || '').trim();
+      return { id, text, text_length: text.length };
     }).filter(message => message.text);
     const messages = assistant_messages.map(message => message.text);
     const buttons = [...document.querySelectorAll('button')];
@@ -3883,7 +3897,12 @@ async function askBrain(args = {}) {
   const adapter = getWebLLMAdapter(provider.id);
   const profile = adapter.profile;
   const timeoutMs = Math.min(Math.max(Number(args.timeout_ms || 120000), 10000), 300000);
-  const promptInfo = compactWebPrompt(rawPrompt, { limit: WEB_PROMPT_MAX_CHARS });
+  // User-authored bridge messages must arrive at the web model intact. The
+  // bounded compiler remains appropriate for internal plan/review prompts,
+  // but relay_message is an explicit lossless transport path.
+  const promptInfo = args.relay_message
+    ? { text: rawPrompt, truncated: false, originalLength: rawPrompt.length, limit: null }
+    : compactWebPrompt(rawPrompt, { limit: WEB_PROMPT_MAX_CHARS });
   const prompt = promptInfo.text;
   let deliveryKey = "";
   let submitted = false;
@@ -4525,7 +4544,7 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {
       route_id: { type: "string" },
       thread_url: { type: "string", description: "Explicit codex://threads/<thread-id> URL from the source Codex conversation." },
-      max_chars: { type: "integer", default: 12000, maximum: 24000 },
+      max_chars: { type: "integer", default: 100000, maximum: 100000, description: "Lossless read ceiling. Content above this limit fails closed instead of being compressed." },
     }, required: ["route_id", "thread_url"] },
   },
   {
