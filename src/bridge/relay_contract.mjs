@@ -125,13 +125,14 @@ export function destinationMatches(expected = {}, actual = {}) {
   return fields.every(field => !text(expected[field]) || text(expected[field]) === text(actual[field]));
 }
 
-export function messageHash({ origin, provider, conversationId, content } = {}) {
+export function messageHash({ origin, provider, conversationId, content, userPrompt = "" } = {}) {
   return crypto.createHash("sha256")
     .update(JSON.stringify({
       origin: nonEmpty(origin),
       provider: nonEmpty(provider),
       conversation_id: nonEmpty(conversationId),
       content: text(content),
+      user_prompt: text(userPrompt),
     }))
     .digest("hex");
 }
@@ -145,11 +146,13 @@ export function createMessageEnvelope({
   turnIndex = 0,
   sourceMessageId = "",
   content,
+  userPrompt = "",
   timestamp = new Date().toISOString(),
 } = {}) {
   const body = text(content);
   if (!body) throw new Error("message content cannot be empty");
-  const hash = messageHash({ origin, provider, conversationId, content: body });
+  const prompt = text(userPrompt);
+  const hash = messageHash({ origin, provider, conversationId, content: body, userPrompt: prompt });
   return {
     origin: nonEmpty(origin, "web_peer"),
     provider: nonEmpty(provider),
@@ -161,6 +164,8 @@ export function createMessageEnvelope({
     message_hash: hash,
     timestamp,
     content: body,
+    original_content: body,
+    user_prompt: prompt,
   };
 }
 

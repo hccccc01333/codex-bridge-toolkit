@@ -69,7 +69,7 @@ export function createRelayEngine({
     }
   }
 
-  async function send({ content, provider, conversationId, conversationTitle, sourceMessageId = "", turnIndex = state.round } = {}) {
+  async function send({ content, userPrompt = "", provider, conversationId, conversationTitle, sourceMessageId = "", turnIndex = state.round } = {}) {
     if (["paused", "completed", "blocked", "disconnected"].includes(state.state)) {
       return { sent: false, state: state.state, reason: state.last_stop || "relay is not active" };
     }
@@ -83,6 +83,7 @@ export function createRelayEngine({
       sourceMessageId,
       turnIndex,
       content,
+      userPrompt,
     });
     if (wasMessageConsumed(envelope, consumed)) return failClosed("duplicate outgoing message", "duplicate_loop");
     let result;

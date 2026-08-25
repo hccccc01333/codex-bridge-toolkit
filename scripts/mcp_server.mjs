@@ -74,6 +74,7 @@ import {
 } from "../src/bridge/relay_contract.mjs";
 import { compileUserGoal } from "../src/bridge/goal_compiler.mjs";
 import { createRelayEngine } from "../src/bridge/relay_engine.mjs";
+import { formatRelayMessage } from "../src/bridge/web_task_prompt.mjs";
 import {
   appendSwarmEvent,
   findSwarmByName,
@@ -2774,12 +2775,20 @@ async function bridgeConnect(args = {}) {
     relayId: routeId,
     verifyDestination: () => verifyBridgeDestination(),
     sendMessage: async envelope => {
+      const relayMessage = formatRelayMessage({
+        direction: "codex_to_web",
+        provider: provider.display_name,
+        sourceTitle: selectedConversation?.title || bridgeLink.conversation?.title || "",
+        content: envelope.content,
+        userPrompt: envelope.user_prompt,
+      });
       const result = await askBrain({
         route_id: routeId,
         session_id: sessionId,
         brain_provider: provider.id,
         port: instance.port,
-        prompt: `[Codex Bridge Message]\nOrigin: Codex\nRelay Round: ${envelope.turn_index}\n\n<content>\n${envelope.content}\n</content>`,
+        prompt: relayMessage.formatted_content,
+        relay_message: relayMessage,
       });
       if (result.isError) throw new Error(resultText(result));
       return { reply: resultText(result), raw: result };
@@ -3438,6 +3447,7 @@ async function bridgeSend(args = {}) {
   try {
     const result = await activeRelayEngine.send({
       content: prompt,
+      userPrompt: args.user_prompt,
       provider: activeBridgeLink.provider_id,
       conversationId: selectedConversation?.id,
       conversationTitle: selectedConversation?.title,
@@ -3461,8 +3471,23 @@ async function bridgeSend(args = {}) {
       relayId: activeBridgeLink.route_id,
       turnIndex: activeBridgeLink.round || 0,
       content: reply,
+      userPrompt: args.user_prompt,
     });
-    return jsonResult(reply, publicBridgeLink({ sent: true, reply, message: envelope, state: activeBridgeLink.state }));
+    const formattedReply = formatRelayMessage({
+      direction: "web_to_codex",
+      provider: activeBridgeLink.provider,
+      sourceTitle: selectedConversation?.title || activeBridgeLink.conversation?.title || "",
+      content: reply,
+      userPrompt: args.user_prompt,
+    });
+    const message = { ...envelope, ...formattedReply };
+    return jsonResult(formattedReply.formatted_content, publicBridgeLink({
+      sent: true,
+      reply,
+      formatted_reply: formattedReply.formatted_content,
+      message,
+      state: activeBridgeLink.state,
+    }));
   } catch (error) {
     const code = error.code || "BRIDGE_SEND_FAILED";
     await pauseActiveBridge(String(error), code);
@@ -3478,7 +3503,7 @@ async function bridgeSend(args = {}) {
   }
 }
 
-async function bridgeReceive() {
+async function bridgeReceive(args = {}) {
   if (!activeBridgeLink) return jsonResult("还没有建立网页端连接", { received: false, state: "idle" }, true);
   if (!activeBridgeLink.goal && !activeBridgeLink.config?.goal && !brainState.goal) {
     return jsonResult("连接已建立，请先回答“你希望 Codex 完成什么？”，再读取网页消息", publicBridgeLink({ received: false, requires_goal: true }), true);
@@ -3512,7 +3537,15 @@ async function bridgeReceive() {
       }
       return jsonResult("网页端暂无新消息", publicBridgeLink({ received: false, new_message: false }));
     }
-    return jsonResult(result.envelope.content, publicBridgeLink({ received: true, new_message: true, message: result.envelope }));
+    const formatted = formatRelayMessage({
+      direction: "web_to_codex",
+      provider: activeBridgeLink.provider,
+      sourceTitle: selectedConversation?.title || activeBridgeLink.conversation?.title || "",
+      content: result.envelope.content,
+      userPrompt: args.user_prompt,
+    });
+    const message = { ...result.envelope, ...formatted };
+    return jsonResult(formatted.formatted_content, publicBridgeLink({ received: true, new_message: true, message }));
   } catch (error) {
     await pauseActiveBridge(String(error), error.code || "BRIDGE_RECEIVE_FAILED");
     return jsonResult(`读取网页消息失败，连接已暂停：${String(error)}`, publicBridgeLink({
@@ -3883,6 +3916,9 @@ async function askBrain(args = {}) {
       conversation_url: selectedConversation?.url || activeSession?.conversation?.url || target?.url || null,
       prompt_length: prompt.length,
       original_prompt_length: rawPrompt.length,
+      original_content: args.relay_message?.original_content || null,
+      user_prompt: args.relay_message?.user_prompt || "",
+      formatted_content: args.relay_message?.formatted_content || prompt,
     });
     let before = await pageSnapshot(provider);
     if (before.loginRequired) {
@@ -4313,13 +4349,14 @@ const TOOLS = [
     description: "Send one explicit Codex message through the active web connection and return the visible web reply with peer-origin metadata.",
     inputSchema: { type: "object", properties: {
       message: { type: "string" },
+      user_prompt: { type: "string", description: "Optional user-authored addition. The bridge defaults to empty and never invents one." },
       timeout_ms: { type: "integer", default: 120000 },
     }, required: ["message"] },
   },
   {
     name: "bridge_receive",
     description: "Read one new visible assistant message from the active web connection without sending a prompt. Deduplicates repeated web replies and marks the peer origin.",
-    inputSchema: { type: "object", properties: {} },
+    inputSchema: { type: "object", properties: { user_prompt: { type: "string", description: "Optional user-authored addition; defaults to empty." } } },
   },
   {
     name: "bridge_run",

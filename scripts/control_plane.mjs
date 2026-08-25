@@ -56,12 +56,23 @@ function getControlDb() {
       state TEXT NOT NULL,
       prompt_length INTEGER NOT NULL DEFAULT 0,
       original_prompt_length INTEGER NOT NULL DEFAULT 0,
+      original_content TEXT,
+      user_prompt TEXT,
+      formatted_content TEXT,
       error TEXT,
       reply_length INTEGER,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
   `);
+  // Upgrade databases created before the message-envelope fields existed.
+  for (const column of [
+    ["original_content", "TEXT"],
+    ["user_prompt", "TEXT"],
+    ["formatted_content", "TEXT"],
+  ]) {
+    try { controlDb.exec(`ALTER TABLE web_deliveries ADD COLUMN ${column[0]} ${column[1]}`); } catch {}
+  }
   return controlDb;
 }
 
@@ -76,6 +87,9 @@ function parseDeliveryRow(row) {
     state: String(row.state || "unknown"),
     prompt_length: Number(row.prompt_length || 0),
     original_prompt_length: Number(row.original_prompt_length || 0),
+    original_content: row.original_content || null,
+    user_prompt: row.user_prompt || "",
+    formatted_content: row.formatted_content || null,
     error: row.error || null,
     reply_length: row.reply_length === null || row.reply_length === undefined ? null : Number(row.reply_length),
     created_at: row.created_at || null,
@@ -121,6 +135,9 @@ export function writeWebDelivery(deliveryId, fields = {}) {
     state: fields.state ?? previous?.state ?? "prepared",
     prompt_length: Number(fields.prompt_length ?? previous?.prompt_length ?? 0),
     original_prompt_length: Number(fields.original_prompt_length ?? previous?.original_prompt_length ?? 0),
+    original_content: fields.original_content ?? previous?.original_content ?? null,
+    user_prompt: fields.user_prompt ?? previous?.user_prompt ?? "",
+    formatted_content: fields.formatted_content ?? previous?.formatted_content ?? null,
     error: fields.error ?? previous?.error ?? null,
     reply_length: fields.reply_length ?? previous?.reply_length ?? null,
     created_at: previous?.created_at || fields.created_at || timestamp,
@@ -131,8 +148,9 @@ export function writeWebDelivery(deliveryId, fields = {}) {
     db.prepare(`
       INSERT INTO web_deliveries (
         delivery_id, route_id, provider, target_id, conversation_url, state,
-        prompt_length, original_prompt_length, error, reply_length, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        prompt_length, original_prompt_length, original_content, user_prompt,
+        formatted_content, error, reply_length, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(delivery_id) DO UPDATE SET
         route_id = excluded.route_id,
         provider = excluded.provider,
@@ -141,6 +159,9 @@ export function writeWebDelivery(deliveryId, fields = {}) {
         state = excluded.state,
         prompt_length = excluded.prompt_length,
         original_prompt_length = excluded.original_prompt_length,
+        original_content = excluded.original_content,
+        user_prompt = excluded.user_prompt,
+        formatted_content = excluded.formatted_content,
         error = excluded.error,
         reply_length = excluded.reply_length,
         created_at = excluded.created_at,
@@ -154,6 +175,9 @@ export function writeWebDelivery(deliveryId, fields = {}) {
       record.state,
       record.prompt_length,
       record.original_prompt_length,
+      record.original_content,
+      record.user_prompt,
+      record.formatted_content,
       record.error,
       record.reply_length,
       record.created_at,

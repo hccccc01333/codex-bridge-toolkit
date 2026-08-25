@@ -119,6 +119,33 @@ Continuous: continue the current goal until complete, blocked, or stopped.
 | Bounded rounds | Run 1–50 controlled rounds; the default bounded limit is 20 |
 | Continuous | Continue the current goal until completion, blocking, repetition, destination change, timeout, or user stop |
 
+### 6. Message envelope
+
+The bridge does not invent context notices or execution instructions for either model. Each relayed message uses a transparent envelope:
+
+```text
+【Codex → 网页端】
+来源 Codex：当前 Codex 对话
+
+【原完整内容】
+The original message body
+
+【用户自己的提示词】
+An optional user-authored addition; this section is omitted when empty
+```
+
+When a web reply returns to Codex, it uses the matching marker:
+
+```text
+【网页端 → Codex 搬运】
+来源网页：农场比赛 - 农场codex
+
+【原完整内容】
+The complete web reply
+```
+
+Original content, the optional user prompt, and the rendered message are stored separately in the local delivery ledger. Use `user_prompt` in `bridge_send` only when the user explicitly supplies an addition; it defaults to empty.
+
 ## OpenCode setup
 
 OpenCode has two integration levels.

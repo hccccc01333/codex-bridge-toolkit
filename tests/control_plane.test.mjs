@@ -112,6 +112,9 @@ test("web delivery records survive a second control-plane process", async () => 
     state: "unknown",
     prompt_length: 12000,
     original_prompt_length: 24000,
+    original_content: "【Codex → 网页端】\n【原完整内容】\n执行 A0",
+    user_prompt: "只返回证据",
+    formatted_content: "【Codex → 网页端】\n【原完整内容】\n执行 A0\n【用户自己的提示词】\n只返回证据",
   });
   const worker = path.resolve("tests/delivery_worker.mjs");
   const child = await new Promise((resolve, reject) => {
@@ -130,6 +133,8 @@ test("web delivery records survive a second control-plane process", async () => 
   assert.equal(child.delivery_id, deliveryId);
   assert.equal(child.state, "unknown");
   assert.equal(child.original_prompt_length, 24000);
+  assert.equal(child.original_content, "【Codex → 网页端】\n【原完整内容】\n执行 A0");
+  assert.equal(child.user_prompt, "只返回证据");
   removeWebDelivery(deliveryId);
   assert.equal(readWebDelivery(deliveryId), null);
 });

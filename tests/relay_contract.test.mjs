@@ -48,6 +48,26 @@ test("message envelopes identify origin and consume each message once", () => {
   assert.equal(wasMessageConsumed(envelope, consumed), true);
 });
 
+test("user-authored relay prompts are stored separately and affect deduplication", () => {
+  const base = createMessageEnvelope({
+    origin: "codex",
+    provider: "chatgpt",
+    conversationId: "conversation-a",
+    content: "执行 A0",
+  });
+  const withPrompt = createMessageEnvelope({
+    origin: "codex",
+    provider: "chatgpt",
+    conversationId: "conversation-a",
+    content: "执行 A0",
+    userPrompt: "只返回证据清单",
+  });
+  assert.equal(base.original_content, "执行 A0");
+  assert.equal(base.user_prompt, "");
+  assert.equal(withPrompt.user_prompt, "只返回证据清单");
+  assert.notEqual(base.message_hash, withPrompt.message_hash);
+});
+
 test("destination verification fails closed when the conversation changes", () => {
   const expected = { provider: "chatgpt", target_id: "tab-1", conversation_id: "conversation-1" };
   assert.equal(destinationMatches(expected, { ...expected }), true);
