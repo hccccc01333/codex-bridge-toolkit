@@ -1,14 +1,14 @@
 {
   "name": "chatgpt-web-bridge",
-  "version": "0.8.0+codex.20260825054256",
-  "description": "A local-first Codex/OpenCode toolkit series: parallel visible Web LLM bridge workers, browser watchdog health events, read-only GitHub workspace binding, safe local artifact context, and fail-closed multi-web-session swarms.",
+  "version": "0.8.0+codex.20260830064555",
+  "description": "A local-first Codex/OpenCode toolkit series: visible Web LLM bridge workers, durable interruption recovery, explicit ZIP/file handoff, browser watchdog health events, and fail-closed multi-web-session swarms.",
   "author": {
     "name": "Local developer"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Bridge Toolkit Series",
-    "shortDescription": "Run isolated Codex\u2194web-AI links and bind local GitHub context safely.",
+    "shortDescription": "Run isolated Codex\u2194web-AI links with safe recovery and explicit file handoff.",
     "longDescription": "Codex Bridge Toolkit Series contains the visible Web LLM Conversation Bridge, parallel Codex and OpenCode host adapters, isolated MCP workers for independent host conversations, a read-only Edge/Chrome browser watchdog with durable health events, human-readable multi-link status, a read-only GitHub workspace binder, generic MCP host compatibility reporting, safe local artifact context, and an experimental fail-closed Web Session Swarm. A swarm coordinates multiple explicitly selected visible web conversations, gives each member its own worker, browser target, and watchdog, and shares only a compact read-only local Git workspace summary. OpenCode can use the toolkit as a local stdio MCP server or expose the documented opencode serve HTTP API for managed execution. Users explicitly select bounded Markdown/text/CSV reads; Word/PPT/PDF remain metadata-only until content adapters are added. The bridge verifies the destination before every send and never auto-replaces tabs or resends uncertain prompts. The GitHub toolkit never pulls, pushes, commits, or contacts GitHub automatically. Computer Use, DevSpace-specific behavior, Notion API, and Word/PPT content adapters are not claimed by this release. No passwords, cookies, API keys, private endpoints, or hidden chain-of-thought are collected.",
     "developerName": "Codex Luna Bridge contributors",
     "category": "Productivity",
@@ -22,6 +22,7 @@
       "List the Codex Bridge toolkit series.",
       "Open the two-column web bridge panel inside this Codex conversation.",
       "Connect this Codex conversation to a visible web AI.",
+      "Check where an interrupted bridge should safely continue.",
       "Check the browser watchdog or current GitHub workspace safely."
     ]
   },

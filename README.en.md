@@ -148,6 +148,34 @@ Original content, the optional user prompt, and the rendered message are stored 
 
 Normal relaying must use the public `bridge_connect`, `bridge_send`, and `bridge_receive` flow, even when the user provides a fixed web URL or fixed Codex URL. Do not replace it with an ad-hoc WebSocket, CDP, or DOM script; those paths cannot provide the bridge's completeness, deduplication, and fail-closed guarantees.
 
+### Recovery after an interruption: durable handoffs
+
+Every confirmed relay writes a local handoff record: direction, content hash, length, the visible web message timestamp when the page exposes one, local observation time, and delivery state. It does not store another copy of the message body.
+
+After a browser, Codex, or plugin interruption, ask the bridge to check where the link stopped. The bridge also runs `bridge_reconcile` before reopening a paused link after an explicit user recovery request. It compares the last visible web peer, the last readable bound Codex peer, and the durable handoff ledger:
+
+```text
+Newer unacknowledged web message → web initiates next
+Newer unacknowledged Codex message → Codex initiates next
+Latest Codex → web send has no stable reply → wait for web; never resend automatically
+```
+
+When timestamps tie, the Codex peer cannot be read, or the destination changed, the result is paused/low-confidence instead of a guess. Reconciliation recommends a safe next initiator only; resuming or sending remains an explicit user action.
+
+### File handoff: ZIP, upload, and download
+
+To give several local deliverables to a ChatGPT web conversation, use three explicit steps:
+
+```text
+1. bridge_attachment_package: package named workspace files into .codex-bridge/attachments/*.zip
+2. bridge_attachment_upload: add that ZIP (or explicitly selected individual files) to the verified web composer
+3. bridge_send: explicitly send the accompanying chat message
+```
+
+Upload only adds files to the composer; it never sends a chat message implicitly. The tool accepts regular files explicitly named inside the workspace, up to 100 files / 500 MB, retains generated ZIP files, and never overwrites an existing archive.
+
+For a web-to-Codex file handoff, call `bridge_attachment_list` first, then choose one `attachment_id` with `bridge_attachment_download`. The file is saved only under `.codex-bridge/downloads/` in the active workspace (or another user-selected workspace-relative directory) and returns its relative path, size, and SHA-256. If the browser cannot use a controlled download directory, the visible attachment changes, or completion cannot be verified, the bridge pauses; it never clicks again or switches tabs.
+
 ## OpenCode setup
 
 OpenCode has two integration levels.
@@ -219,6 +247,8 @@ See [examples/opencode/](examples/opencode/) for a copyable template. Use OpenCo
 | Browser Watchdog | ✅ | Login, composer, send button, generation timeout, disconnect, and selector degradation |
 | Goal and evidence loop | ✅ | plan → execute → report → review; completion requires evidence |
 | Multi-web-session Swarm | ✅ experimental | Independent worker, target, and watchdog per member; group pauses on failure |
+| Interruption attribution and recovery advice | ✅ | Compares the latest web/Codex message timestamps with durable handoffs; recommends the next initiator only, never auto-resends |
+| ChatGPT web file handoff | ✅ | Explicit ZIP packaging, same-conversation upload, and visible attachment selection for download; failure pauses |
 | Local GitHub workspace | ✅ read-only | Captures repository, branch, HEAD, and change-count summaries; no automatic pull/push/commit |
 | Local artifact tools | 🟡 | Discovers Word/PPT/PDF metadata; reads explicitly selected Markdown/text/CSV only |
 | Notion / Word / PPT body collaboration | ⏳ | Body adapters are not included in this release |
@@ -320,6 +350,14 @@ A normally launched Edge cannot be attached after the fact. Let the bridge start
 The bridge refreshes the original tab once and checks again. If recovery fails, it keeps the original target and pauses. It does not create another tab or resend the prompt.
 
 If web delivery fails, the link enters `PAUSED`; it does not continue waiting for or reading a web reply. Repair the original tab, then explicitly resume so the bridge can re-check the destination and retry safely.
+
+### It is unclear which side should continue after an interruption
+
+Ask the bridge to check where the link stopped. It compares the last visible assistant message in the original web tab, the last assistant message in the bound Codex conversation/worker when readable, and the local handoff ledger. It reports `web initiates next`, `Codex initiates next`, `wait for web`, or `cannot determine safely`; it never resends on its own.
+
+### Files need to go to or come from the web chat
+
+Do not ask the bridge to scan a directory. Explicitly select files, package when needed, upload into the current composer, and then explicitly send the message. For a web download, list visible attachments first and select one `attachment_id`. If the provider UI lacks a recognized download control or the browser cannot save inside the workspace, the bridge pauses and preserves the original tab.
 
 ### The message would go to the wrong web conversation
 

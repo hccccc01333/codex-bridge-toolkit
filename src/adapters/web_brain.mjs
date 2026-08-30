@@ -13,6 +13,14 @@ const CHATGPT = Object.freeze({
   send_selectors: Object.freeze([
     'button[data-testid="send-button"]',
   ]),
+  attachment_input_selectors: Object.freeze([
+    'input[type="file"]',
+  ]),
+  attachment_download_selectors: Object.freeze([
+    'a[download]',
+    'button[aria-label*="download" i]',
+    'button[aria-label*="下载"]',
+  ]),
   assistant_selectors: Object.freeze([
     '[data-message-author-role="assistant"]',
   ]),
@@ -43,6 +51,14 @@ const DEEPSEEK = Object.freeze({
     'button[type="submit"]',
     'button[aria-label*="Send" i]',
     'button[aria-label*="发送"]',
+  ]),
+  attachment_input_selectors: Object.freeze([
+    'input[type="file"]',
+  ]),
+  attachment_download_selectors: Object.freeze([
+    'a[download]',
+    'button[aria-label*="download" i]',
+    'button[aria-label*="下载"]',
   ]),
   assistant_selectors: Object.freeze([
     '[data-testid*="assistant"]',

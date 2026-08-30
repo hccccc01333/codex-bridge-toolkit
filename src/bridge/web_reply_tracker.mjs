@@ -19,6 +19,8 @@ function normalizeMessages(snapshot = {}) {
     .map((message, index) => ({
       id: text(message?.id) || `assistant-${index}`,
       text: text(message?.text ?? message),
+      displayed_at: text(message?.displayed_at ?? message?.displayedAt) || null,
+      observed_at: text(message?.observed_at ?? message?.observedAt) || null,
     }))
     .filter(message => message.text);
 }

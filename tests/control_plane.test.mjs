@@ -14,11 +14,13 @@ const {
   controlPlaneCapabilities,
   newRouteRecord,
   readWebDelivery,
+  readRelayHandoffs,
   removeWebDelivery,
   readRoute,
   routeQueueState,
   updateRoute,
   writeWebDelivery,
+  writeRelayHandoff,
   writeRoute,
 } = controlPlane;
 
@@ -137,6 +139,29 @@ test("web delivery records survive a second control-plane process", async () => 
   assert.equal(child.user_prompt, "只返回证据");
   removeWebDelivery(deliveryId);
   assert.equal(readWebDelivery(deliveryId), null);
+});
+
+test("relay handoffs persist direction, timestamps, and content hashes without storing a transcript", () => {
+  const routeId = `handoff-route-${Date.now()}`;
+  resetRoute(routeId, { session_id: `${routeId}-session` });
+  writeRelayHandoff(`handoff-${routeId}`, {
+    route_id: routeId,
+    direction: "web_to_codex",
+    state: "delivered_to_codex",
+    provider: "chatgpt",
+    source_message_id: "visible-message-1",
+    content_hash: "a".repeat(64),
+    content_length: 456,
+    source_displayed_at: "2026-08-30T01:00:00.000Z",
+    source_observed_at: "2026-08-30T01:00:02.000Z",
+    destination_observed_at: "2026-08-30T01:00:03.000Z",
+  });
+  const handoff = readRelayHandoffs(routeId)[0];
+  assert.equal(handoff.direction, "web_to_codex");
+  assert.equal(handoff.state, "delivered_to_codex");
+  assert.equal(handoff.content_hash, "a".repeat(64));
+  assert.equal(handoff.content_length, 456);
+  assert.equal(Object.hasOwn(handoff, "content"), false);
 });
 
 test("T8 actions for one route are serialized", async () => {

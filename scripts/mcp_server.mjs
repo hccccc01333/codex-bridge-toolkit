@@ -20,9 +20,11 @@ import {
   routeIdOf,
   routeQueueState,
   routeSummary,
+  readRelayHandoffs,
   readWebDelivery,
   removeWebDelivery,
   updateRoute,
+  writeRelayHandoff,
   writeWebDelivery,
   writeRoute,
 } from "./control_plane.mjs";
@@ -74,7 +76,20 @@ import {
 } from "../src/bridge/relay_contract.mjs";
 import { compileUserGoal } from "../src/bridge/goal_compiler.mjs";
 import { createRelayEngine } from "../src/bridge/relay_engine.mjs";
+import {
+  createRelayHandoffId,
+  extractLatestCodexPeerMessage,
+  normalizePeerMessage,
+  reconcileRelay,
+  relayContentHash,
+} from "../src/bridge/relay_recovery.mjs";
 import { formatRelayMessage } from "../src/bridge/web_task_prompt.mjs";
+import {
+  packageSelectedAttachments,
+  prepareAttachmentOutputDirectory,
+  resolveSelectedAttachmentFiles,
+  sha256File,
+} from "../src/bridge/web_attachments.mjs";
 import {
   appendSwarmEvent,
   findSwarmByName,
@@ -1615,6 +1630,71 @@ function durableWebDelivery(deliveryId, fields = {}) {
   });
 }
 
+function durableRelayHandoff(direction, rawMessage = {}, fields = {}) {
+  const content = String(rawMessage.content ?? rawMessage.text ?? "").trim();
+  if (!content) return null;
+  const peer = normalizePeerMessage(rawMessage);
+  const routeId = activeBridgeLink?.route_id || activeRouteId;
+  const handoffId = createRelayHandoffId({
+    routeId,
+    direction,
+    sourceMessageId: peer.source_message_id,
+    content,
+    provider: fields.provider || activeBridgeLink?.provider_id || "",
+  });
+  return writeRelayHandoff(handoffId, {
+    route_id: routeId,
+    direction,
+    state: fields.state || "delivered",
+    provider: fields.provider || activeBridgeLink?.provider_id || null,
+    source_message_id: peer.source_message_id,
+    content_hash: peer.content_hash || relayContentHash(content),
+    content_length: peer.content_length,
+    source_displayed_at: peer.displayed_at,
+    source_observed_at: peer.observed_at,
+    destination_observed_at: fields.destination_observed_at || new Date().toISOString(),
+    delivery_id: fields.delivery_id || null,
+    error: fields.error || null,
+  });
+}
+
+function publicPeerSnapshot(snapshot = {}) {
+  return {
+    available: Boolean(snapshot.available),
+    displayed_at: snapshot.displayed_at || null,
+    observed_at: snapshot.observed_at || null,
+    timestamp_basis: snapshot.timestamp_basis || "unavailable",
+    content_length: Number(snapshot.content_length || 0),
+    relay_envelope: Boolean(snapshot.relay_envelope),
+  };
+}
+
+async function readBoundCodexPeerSnapshot() {
+  const route = activeBridgeLink ? readRoute(activeBridgeLink.route_id) : activeRoute;
+  const threadId = route?.codex_thread_id;
+  if (!threadId) {
+    return {
+      available: false,
+      reason: "当前桥接尚未绑定可读取的 Codex 对话或 Worker",
+    };
+  }
+  try {
+    const provider = executorProviderOf({}, route.executor_provider || DEFAULT_EXECUTOR_PROVIDER);
+    const model = executorModelFor({ executor_model: route.executor_model }, provider);
+    const profile = executorProfileFor({ executor_profile: route.executor_profile }, provider, model);
+    const endpoint = executorEndpointFor({ executor_endpoint: route.executor_endpoint }, provider);
+    const agent = executorAgentFor({ executor_agent: route.executor_agent }, provider);
+    const result = await codexAdapterForRoute(route.route_id, provider.id, model, profile, endpoint, agent).readThread(threadId);
+    return extractLatestCodexPeerMessage(result);
+  } catch (error) {
+    return {
+      available: false,
+      reason: String(error),
+      code: error.code || "CODEX_THREAD_READ_FAILED",
+    };
+  }
+}
+
 async function brainPlan(args = {}) {
   activateRoute(args);
   const goal = clip(args.goal);
@@ -1911,6 +1991,105 @@ async function evaluate(expression) {
     throw new Error(`page evaluation failed: ${detail}`);
   }
   return result?.result?.value;
+}
+
+function attachmentError(message, code) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+async function findAttachmentInput(selectors = []) {
+  await cdpRaw("DOM.enable", {});
+  const documentNode = await cdpRaw("DOM.getDocument", { depth: 1, pierce: true });
+  const rootId = documentNode?.root?.nodeId;
+  if (!rootId) throw attachmentError("could not inspect the visible page DOM", "ATTACHMENT_DOM_UNAVAILABLE");
+  for (const selector of selectors) {
+    const found = await cdpRaw("DOM.querySelector", { nodeId: rootId, selector });
+    if (!found?.nodeId) continue;
+    const description = await cdpRaw("DOM.describeNode", { nodeId: found.nodeId, depth: 0 });
+    if (description?.node?.backendNodeId) return { selector, backendNodeId: description.node.backendNodeId };
+  }
+  throw attachmentError("the current web page has no visible-provider file input", "ATTACHMENT_INPUT_NOT_FOUND");
+}
+
+async function uploadSelectedAttachments(provider, files) {
+  const selectors = provider.attachment_input_selectors || ["input[type=\"file\"]"];
+  const input = await findAttachmentInput(selectors);
+  await cdpRaw("DOM.setFileInputFiles", {
+    files: files.map(file => file.absolute_path),
+    backendNodeId: input.backendNodeId,
+  });
+  await new Promise(resolve => setTimeout(resolve, 300));
+  const confirmation = await evaluate(`(() => {
+    const selectors = ${JSON.stringify(selectors)};
+    const input = selectors.map(selector => document.querySelector(selector)).find(Boolean);
+    if (!input) return { confirmed: false, reason: 'input-not-found-after-upload', names: [] };
+    const names = [...(input.files || [])].map(file => file.name);
+    return { confirmed: names.length > 0, names };
+  })()`);
+  const expected = files.map(file => file.name);
+  const confirmed = expected.every(name => confirmation?.names?.includes(name));
+  if (!confirmed) {
+    throw attachmentError("the web page did not confirm every selected attachment; it was not sent as a chat message", "ATTACHMENT_UPLOAD_UNCONFIRMED");
+  }
+  return { selector: input.selector, names: expected };
+}
+
+async function scanVisibleDownloadCandidates(provider) {
+  const selectors = provider.attachment_download_selectors || ["a[download]"];
+  return evaluate(`(() => {
+    const selectors = ${JSON.stringify(selectors)};
+    const nodes = selectors.flatMap(selector => [...document.querySelectorAll(selector)]);
+    const unique = [...new Set(nodes)].filter(node => {
+      if (node.tagName === 'A') return node.hasAttribute('download');
+      const label = ((node.getAttribute('aria-label') || '') + ' ' + (node.innerText || '')).toLowerCase();
+      return label.includes('download') || label.includes('下载');
+    });
+    return unique.slice(-100).map((node, index) => ({
+      attachment_id: String(index + 1),
+      index,
+      tag: node.tagName,
+      name: String(node.getAttribute('download') || node.getAttribute('aria-label') || node.innerText || '附件').trim().slice(0, 240),
+      href: node.tagName === 'A' ? String(node.href || '') : '',
+    }));
+  })()`);
+}
+
+function publicDownloadCandidates(candidates = []) {
+  return candidates.map(candidate => ({
+    attachment_id: candidate.attachment_id,
+    name: candidate.name || "附件",
+  }));
+}
+
+function directorySnapshot(directory) {
+  const values = new Map();
+  for (const name of fs.readdirSync(directory)) {
+    const candidate = path.join(directory, name);
+    try {
+      const stat = fs.statSync(candidate);
+      if (stat.isFile()) values.set(name, { size: stat.size, mtime_ms: stat.mtimeMs });
+    } catch {}
+  }
+  return values;
+}
+
+async function waitForDownloadedFile(directory, before, timeoutMs = 60000) {
+  const deadline = Date.now() + Math.min(Math.max(Number(timeoutMs) || 60000, 3000), 60000);
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 500));
+    const after = directorySnapshot(directory);
+    const candidates = [...after.entries()]
+      .filter(([name, stat]) => !name.endsWith(".crdownload") && (!before.has(name) || before.get(name).size !== stat.size || before.get(name).mtime_ms !== stat.mtime_ms))
+      .sort((left, right) => right[1].mtime_ms - left[1].mtime_ms);
+    if (!candidates.length) continue;
+    const [name, firstStat] = candidates[0];
+    await new Promise(resolve => setTimeout(resolve, 700));
+    const finalStat = fs.statSync(path.join(directory, name));
+    if (finalStat.size === firstStat.size) return { name, bytes: finalStat.size };
+  }
+  throw attachmentError("no completed browser download appeared in the selected workspace directory", "ATTACHMENT_DOWNLOAD_TIMEOUT");
 }
 
 async function createBrainTarget(port, provider = brainProviderOf(), session = activeSession) {
@@ -2564,6 +2743,13 @@ function publicBridgeLink(extra = {}) {
       error: activeBridgeRun.error || null,
     } : null,
     failure: activeBridgeLink.failure || null,
+    recovery: activeBridgeLink.recovery ? {
+      status: activeBridgeLink.recovery.status,
+      interruption_side: activeBridgeLink.recovery.interruption_side || null,
+      next_initiator: activeBridgeLink.recovery.next_initiator || null,
+      confidence: activeBridgeLink.recovery.confidence || null,
+      checked_at: activeBridgeLink.recovery.checked_at || null,
+    } : activeRoute?.relay_recovery || null,
     requires_goal: !Boolean(activeBridgeLink.goal || activeBridgeLink.config?.goal || brainState.goal)
       && ["awaiting_goal", "connected", "ready"].includes(activeBridgeLink.state),
     ...extra,
@@ -2643,6 +2829,11 @@ async function bridgeConnect(args = {}) {
     const healthy = Boolean(health.structuredContent?.healthy);
     const hasGoal = Boolean(activeBridgeLink.goal || activeBridgeLink.config?.goal || brainState.goal);
     if (healthy && activeRelayEngine?.status?.().state === "paused") {
+      // Recovery is a comparison, not a resend. Perform it before reopening a
+      // paused relay so the user can see which side safely owns the next turn.
+      const recoveryResult = await bridgeReconcile();
+      const recovery = recoveryResult?.structuredContent?.reconciliation;
+      if (recovery?.status === "paused") return recoveryResult;
       const resumed = await activeRelayEngine.resume?.("用户确认已修复网页连接");
       if (!resumed?.resumed) {
         return jsonResult("网页连接仍处于暂停状态，请先断开并重新连接", publicBridgeLink({
@@ -2651,6 +2842,7 @@ async function bridgeConnect(args = {}) {
         }), true);
       }
       activeBridgeLink.failure = null;
+      activeBridgeLink.recovery = recovery || activeBridgeLink.recovery;
     }
     const relayState = activeRelayEngine?.status?.().state;
     activeBridgeLink.state = healthy
@@ -2805,12 +2997,44 @@ async function bridgeConnect(args = {}) {
         prompt: relayMessage.formatted_content,
         relay_message: relayMessage,
       });
+      const transfer = result?.structuredContent || {};
+      if (transfer.sent) {
+        durableRelayHandoff("codex_to_web", {
+          content: envelope.content,
+          source_message_id: envelope.source_message_id,
+          displayed_at: envelope.timestamp,
+          observed_at: envelope.timestamp,
+        }, {
+          provider: provider.id,
+          state: transfer.delivery_state === "completed" ? "completed" : "submitted",
+          delivery_id: transfer.delivery_id || null,
+        });
+      }
       if (result.isError) throw new Error(resultText(result));
-      return { reply: resultText(result), raw: result };
+      const reply = resultText(result);
+      const replyMessage = {
+        content: reply,
+        source_message_id: transfer.reply_message_id || "",
+        displayed_at: transfer.reply_displayed_at || null,
+        observed_at: new Date().toISOString(),
+      };
+      if (reply) {
+        durableRelayHandoff("web_to_codex", replyMessage, {
+          provider: provider.id,
+          state: "delivered_to_codex",
+          delivery_id: transfer.delivery_id || null,
+        });
+      }
+      return { reply, reply_message: replyMessage, raw: result };
     },
     receiveMessage: async () => {
       const snapshot = await pageSnapshot(provider);
-      return { content: snapshot.last, source_message_id: snapshot.url };
+      return {
+        content: snapshot.last_message?.text || snapshot.last,
+        source_message_id: snapshot.last_message?.id || snapshot.url,
+        displayed_at: snapshot.last_message?.displayed_at || null,
+        observed_at: snapshot.last_message?.observed_at || new Date().toISOString(),
+      };
     },
     executeRound: async roundArgs => {
       const result = await runRound({
@@ -3552,6 +3776,15 @@ async function bridgeReceive(args = {}) {
       }
       return jsonResult("网页端暂无新消息", publicBridgeLink({ received: false, new_message: false }));
     }
+    durableRelayHandoff("web_to_codex", {
+      content: result.envelope.content,
+      source_message_id: result.envelope.source_message_id,
+      displayed_at: result.result?.displayed_at || null,
+      observed_at: result.result?.observed_at || new Date().toISOString(),
+    }, {
+      provider: activeBridgeLink.provider_id,
+      state: "delivered_to_codex",
+    });
     const formatted = formatRelayMessage({
       direction: "web_to_codex",
       provider: activeBridgeLink.provider,
@@ -3569,6 +3802,217 @@ async function bridgeReceive(args = {}) {
       reason: String(error),
       requires_resume: true,
       failure: activeBridgeLink.failure,
+    }), true);
+  }
+}
+
+function reconciliationMessage(result = {}) {
+  if (result.status === "recovery_ready") {
+    return result.next_initiator === "web"
+      ? "已定位中断点：下一条应由网页端发起；未自动重发。"
+      : "已定位中断点：下一条应由 Codex 发起；未自动重发。";
+  }
+  if (result.status === "waiting_for_web") return "最近一次网页发送尚未获得稳定回复；请等待网页端完成，未自动重发。";
+  if (result.status === "in_sync") return "两端交接记录一致，目前无需恢复发送。";
+  return "无法安全判断中断位置，连接保持暂停，未自动重发。";
+}
+
+async function bridgeReconcile() {
+  if (!activeBridgeLink) return jsonResult("还没有建立网页端连接", { reconciled: false, state: "idle" }, true);
+  let verification;
+  try {
+    verification = await verifyBridgeDestination();
+  } catch (error) {
+    await pauseActiveBridge(String(error), error.code || "RECONCILIATION_DESTINATION_FAILED");
+    return jsonResult(`无法比较中断位置，连接已暂停：${String(error)}`, publicBridgeLink({
+      reconciled: false,
+      reconciliation: {
+        status: "paused",
+        interruption_side: "destination_unavailable",
+        next_initiator: null,
+        reason: String(error),
+        confidence: "high",
+      },
+    }), true);
+  }
+  const webSnapshot = await pageSnapshot(verification.provider);
+  const web = normalizePeerMessage(webSnapshot.last_message || { content: webSnapshot.last });
+  const codex = await readBoundCodexPeerSnapshot();
+  const handoffs = readRelayHandoffs(activeBridgeLink.route_id, { limit: 80 });
+  const reconciliation = reconcileRelay({ web, codex, handoffs });
+  const publicResult = {
+    ...reconciliation,
+    web: publicPeerSnapshot(web),
+    codex: publicPeerSnapshot(codex),
+    codex_read_reason: codex.reason || null,
+    recorded_handoffs: handoffs.length,
+    checked_at: new Date().toISOString(),
+  };
+  activeBridgeLink.recovery = publicResult;
+  const route = updateRoute(activeBridgeLink.route_id, {
+    relay_recovery: {
+      status: reconciliation.status,
+      interruption_side: reconciliation.interruption_side,
+      next_initiator: reconciliation.next_initiator,
+      confidence: reconciliation.confidence,
+      checked_at: publicResult.checked_at,
+    },
+    last_action: "bridge_reconcile",
+  });
+  activeRoute = route;
+  appendRouteEvent(activeBridgeLink.route_id, {
+    type: "RELAY_RECONCILED",
+    summary: reconciliation.reason,
+    data: {
+      status: reconciliation.status,
+      interruption_side: reconciliation.interruption_side,
+      next_initiator: reconciliation.next_initiator,
+      confidence: reconciliation.confidence,
+    },
+  });
+  return jsonResult(reconciliationMessage(reconciliation), publicBridgeLink({
+    reconciled: true,
+    reconciliation: publicResult,
+  }), reconciliation.status === "paused");
+}
+
+function attachmentWorkspace(args = {}) {
+  return args.cwd || activeBridgeLink?.workspace?.root || activeRoute?.workspace?.root || process.cwd();
+}
+
+async function bridgeAttachmentPackage(args = {}) {
+  try {
+    const packaged = await packageSelectedAttachments({
+      cwd: attachmentWorkspace(args),
+      files: args.files,
+      archive_name: args.archive_name,
+    });
+    return jsonResult(`已打包 ${packaged.files.length} 个用户选择的文件；尚未上传。`, {
+      packaged: true,
+      archive_relative_path: packaged.archive_relative_path,
+      archive_name: packaged.archive_name,
+      archive_bytes: packaged.archive_bytes,
+      archive_sha256: packaged.archive_sha256,
+      source_file_count: packaged.files.length,
+      source_total_bytes: packaged.total_source_bytes,
+      files: packaged.files.map(file => ({ relative_path: file.relative_path, name: file.name, bytes: file.bytes })),
+    });
+  } catch (error) {
+    return jsonResult(String(error), { packaged: false, code: error.code || "ATTACHMENT_PACKAGE_FAILED" }, true);
+  }
+}
+
+async function bridgeAttachmentUpload(args = {}) {
+  if (!activeBridgeLink) return jsonResult("还没有建立网页端连接，未上传任何文件", { uploaded: false, state: "idle" }, true);
+  let pageInteractionStarted = false;
+  try {
+    const { provider } = await verifyBridgeDestination();
+    const selected = resolveSelectedAttachmentFiles({ cwd: attachmentWorkspace(args), files: args.files });
+    pageInteractionStarted = true;
+    const uploaded = await uploadSelectedAttachments(provider, selected.files);
+    activeBridgeLink.pending_attachments = selected.files.map(file => ({ name: file.name, bytes: file.bytes }));
+    appendRouteEvent(activeBridgeLink.route_id, {
+      type: "WEB_ATTACHMENT_UPLOADED",
+      summary: `${selected.files.length} selected attachment(s) added to the current web composer`,
+      data: { count: selected.files.length, names: selected.files.map(file => file.name) },
+    });
+    return jsonResult(`已将 ${selected.files.length} 个已选择文件添加到当前网页对话的编辑器；尚未发送聊天消息。`, publicBridgeLink({
+      uploaded: true,
+      attachments: selected.files.map(file => ({ relative_path: file.relative_path, name: file.name, bytes: file.bytes })),
+      upload_selector: uploaded.selector,
+      message_sent: false,
+    }));
+  } catch (error) {
+    const mustPause = pageInteractionStarted || /^(DESTINATION|BROWSER)_/.test(String(error.code || ""));
+    if (mustPause) await pauseActiveBridge(String(error), error.code || "ATTACHMENT_UPLOAD_FAILED");
+    return jsonResult(mustPause ? `网页附件上传未确认，连接已暂停：${String(error)}` : `文件未上传：${String(error)}`, publicBridgeLink({
+      uploaded: false,
+      state: mustPause ? "paused" : activeBridgeLink.state,
+      code: error.code || "ATTACHMENT_UPLOAD_FAILED",
+      message_sent: false,
+      requires_resume: mustPause,
+    }), true);
+  }
+}
+
+async function bridgeAttachmentList() {
+  if (!activeBridgeLink) return jsonResult("还没有建立网页端连接", { listed: false, state: "idle" }, true);
+  try {
+    const { provider } = await verifyBridgeDestination();
+    const candidates = await scanVisibleDownloadCandidates(provider);
+    activeBridgeLink.download_candidates = candidates;
+    return jsonResult(candidates.length ? `发现 ${candidates.length} 个网页端可见附件下载项。` : "当前网页对话没有可识别的可见附件下载项。", publicBridgeLink({
+      listed: true,
+      attachments: publicDownloadCandidates(candidates),
+      note: "请使用 attachment_id 明确选择一个附件下载；插件不会自动下载。",
+    }));
+  } catch (error) {
+    await pauseActiveBridge(String(error), error.code || "ATTACHMENT_LIST_FAILED");
+    return jsonResult(`无法读取网页附件列表，连接已暂停：${String(error)}`, publicBridgeLink({ listed: false, state: "paused", requires_resume: true }), true);
+  }
+}
+
+async function bridgeAttachmentDownload(args = {}) {
+  if (!activeBridgeLink) return jsonResult("还没有建立网页端连接", { downloaded: false, state: "idle" }, true);
+  const attachmentId = String(args.attachment_id || "").trim();
+  const candidate = (activeBridgeLink.download_candidates || []).find(item => item.attachment_id === attachmentId);
+  if (!candidate) {
+    return jsonResult("请先列出当前网页端可见附件，并明确选择 attachment_id；未点击网页下载。", { downloaded: false, list_required: true }, true);
+  }
+  let downloadClickStarted = false;
+  try {
+    const { provider } = await verifyBridgeDestination();
+    const output = prepareAttachmentOutputDirectory({ cwd: attachmentWorkspace(args), directory: args.download_dir });
+    try {
+      await cdpRaw("Page.setDownloadBehavior", { behavior: "allow", downloadPath: output.output_directory });
+    } catch (error) {
+      throw attachmentError(`browser does not expose a controlled download directory: ${String(error)}`, "ATTACHMENT_DOWNLOAD_CONTROL_UNAVAILABLE");
+    }
+    const before = directorySnapshot(output.output_directory);
+    const clicked = await evaluate(`(() => {
+      const selectors = ${JSON.stringify(provider.attachment_download_selectors || ["a[download]"])};
+      const nodes = selectors.flatMap(selector => [...document.querySelectorAll(selector)]);
+      const unique = [...new Set(nodes)].filter(node => {
+        if (node.tagName === 'A') return node.hasAttribute('download');
+        const label = ((node.getAttribute('aria-label') || '') + ' ' + (node.innerText || '')).toLowerCase();
+        return label.includes('download') || label.includes('下载');
+      });
+      const desired = ${JSON.stringify({ index: candidate.index, tag: candidate.tag, name: candidate.name, href: candidate.href })};
+      const node = unique[desired.index];
+      if (!node) return { clicked: false, reason: 'attachment-list-changed' };
+      const name = String(node.getAttribute('download') || node.getAttribute('aria-label') || node.innerText || '附件').trim().slice(0, 240);
+      const href = node.tagName === 'A' ? String(node.href || '') : '';
+      if (node.tagName !== desired.tag || name !== desired.name || href !== desired.href) return { clicked: false, reason: 'attachment-identity-changed' };
+      node.click();
+      return { clicked: true };
+    })()`);
+    if (!clicked?.clicked) throw attachmentError(`the visible attachment was not clicked: ${clicked?.reason || "unknown"}`, "ATTACHMENT_DOWNLOAD_NOT_CLICKED");
+    downloadClickStarted = true;
+    const downloaded = await waitForDownloadedFile(output.output_directory, before, args.timeout_ms);
+    const absolutePath = path.join(output.output_directory, downloaded.name);
+    const relativePath = path.relative(output.workspace_root, absolutePath);
+    appendRouteEvent(activeBridgeLink.route_id, {
+      type: "WEB_ATTACHMENT_DOWNLOADED",
+      summary: `downloaded selected web attachment: ${downloaded.name}`,
+      data: { name: downloaded.name, bytes: downloaded.bytes, relative_path: relativePath },
+    });
+    return jsonResult(`已下载网页端明确选择的附件：${downloaded.name}`, publicBridgeLink({
+      downloaded: true,
+      file: {
+        relative_path: relativePath,
+        name: downloaded.name,
+        bytes: downloaded.bytes,
+        sha256: await sha256File(absolutePath),
+      },
+    }));
+  } catch (error) {
+    const mustPause = downloadClickStarted || /^(DESTINATION|BROWSER)_/.test(String(error.code || ""));
+    if (mustPause) await pauseActiveBridge(String(error), error.code || "ATTACHMENT_DOWNLOAD_FAILED");
+    return jsonResult(mustPause ? `网页附件下载未确认，连接已暂停：${String(error)}` : `未开始网页附件下载：${String(error)}`, publicBridgeLink({
+      downloaded: false,
+      state: mustPause ? "paused" : activeBridgeLink.state,
+      code: error.code || "ATTACHMENT_DOWNLOAD_FAILED",
+      requires_resume: mustPause,
     }), true);
   }
 }
@@ -3814,7 +4258,23 @@ async function pageSnapshot(provider = brainProviderOf()) {
         || '';
       const id = explicitId || ('assistant-' + index);
       const text = (node.innerText || '').trim();
-      return { id, text, text_length: text.length };
+      const timeNode = node.querySelector('time[datetime]')
+        || node.closest('article')?.querySelector('time[datetime]')
+        || null;
+      const rawTimestamp = timeNode?.getAttribute('datetime')
+        || node.getAttribute('data-message-created-at')
+        || node.getAttribute('data-created-at')
+        || null;
+      const parsedTimestamp = rawTimestamp && !Number.isNaN(Date.parse(rawTimestamp))
+        ? new Date(rawTimestamp).toISOString()
+        : null;
+      return {
+        id,
+        text,
+        text_length: text.length,
+        displayed_at: parsedTimestamp,
+        observed_at: new Date().toISOString(),
+      };
     }).filter(message => message.text);
     const messages = assistant_messages.map(message => message.text);
     const buttons = [...document.querySelectorAll('button')];
@@ -3825,7 +4285,16 @@ async function pageSnapshot(provider = brainProviderOf()) {
     const bodyText = (document.body?.innerText || '').slice(0, 3000);
     const lowerBody = bodyText.toLowerCase();
     const loginRequired = location.pathname.includes('/auth/') || ${loginTerms}.some(term => lowerBody.includes(term.toLowerCase()));
-    return { url: location.href, loginRequired, messages, assistant_messages, last: messages.at(-1) || '', generating };
+    const last_message = assistant_messages.at(-1) || null;
+    return {
+      url: location.href,
+      loginRequired,
+      messages,
+      assistant_messages,
+      last: last_message?.text || '',
+      last_message,
+      generating,
+    };
   })()`);
 }
 
@@ -4103,6 +4572,8 @@ async function askBrain(args = {}) {
           browser_target_id: activeSession?.target_id || null,
           delivery_state: "completed",
           delivery_id: deliveryKey,
+          reply_message_id: replyState.candidate.id || null,
+          reply_displayed_at: replyState.candidate.displayed_at || null,
           prompt_truncated: promptInfo.truncated,
           original_prompt_length: promptInfo.originalLength,
         });
@@ -4376,6 +4847,43 @@ const TOOLS = [
     name: "bridge_receive",
     description: "Read one new visible assistant message from the active web connection without sending a prompt. Deduplicates repeated web replies and marks the peer origin.",
     inputSchema: { type: "object", properties: { user_prompt: { type: "string", description: "Optional user-authored addition; defaults to empty." } } },
+  },
+  {
+    name: "bridge_reconcile",
+    description: "Compare the latest visible web message, the bound Codex peer message, and the durable handoff ledger after an interruption. It identifies the safe next initiator when possible, but never auto-resends a message.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "bridge_attachment_package",
+    description: "Create a ZIP from explicitly selected regular files inside the current local workspace. This is local-only packaging: it never uploads the archive or sends a chat message.",
+    inputSchema: { type: "object", properties: {
+      cwd: { type: "string", description: "Optional workspace root. Defaults to the active bridge workspace or current Codex workspace." },
+      files: { type: "array", minItems: 1, maxItems: 100, items: { type: "string" }, description: "Explicit relative paths inside the workspace. Directories, paths outside the workspace, and unselected files are rejected." },
+      archive_name: { type: "string", description: "Optional ZIP filename without a path. A non-conflicting name is chosen automatically." },
+    }, required: ["files"] },
+  },
+  {
+    name: "bridge_attachment_upload",
+    description: "Explicitly add selected workspace files to the composer of the exact active web conversation. It verifies the bound destination and file-input confirmation, but does not send a chat message.",
+    inputSchema: { type: "object", properties: {
+      cwd: { type: "string", description: "Optional workspace root. Defaults to the active bridge workspace or current Codex workspace." },
+      files: { type: "array", minItems: 1, maxItems: 100, items: { type: "string" }, description: "Explicit relative files to upload. Use bridge_attachment_package first when several files should be sent as one ZIP." },
+    }, required: ["files"] },
+  },
+  {
+    name: "bridge_attachment_list",
+    description: "List visible downloadable attachments in the exact active web conversation. It is read-only and never clicks or downloads a file.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "bridge_attachment_download",
+    description: "Download one attachment explicitly selected from bridge_attachment_list into a relative directory inside the active workspace. It uses visible-page clicking and pauses if controlled download confirmation fails.",
+    inputSchema: { type: "object", properties: {
+      attachment_id: { type: "string", description: "Attachment choice returned by bridge_attachment_list." },
+      cwd: { type: "string", description: "Optional workspace root. Defaults to the active bridge workspace or current Codex workspace." },
+      download_dir: { type: "string", default: ".codex-bridge/downloads", description: "Relative output directory inside the workspace." },
+      timeout_ms: { type: "integer", minimum: 3000, maximum: 60000, default: 60000 },
+    }, required: ["attachment_id"] },
   },
   {
     name: "bridge_run",
@@ -4771,7 +5279,7 @@ for (const [alias, sourceName] of BRAIN_TOOL_ALIASES) {
   });
 }
 
-const PUBLIC_BRIDGE_TOOLS = new Set(["bridge_discover", "bridge_connect", "bridge_goal_create", "bridge_status", "bridge_focus", "bridge_send", "bridge_receive", "bridge_run", "bridge_pause", "bridge_disconnect", "bridge_panel"]);
+const PUBLIC_BRIDGE_TOOLS = new Set(["bridge_discover", "bridge_connect", "bridge_goal_create", "bridge_status", "bridge_focus", "bridge_send", "bridge_receive", "bridge_reconcile", "bridge_attachment_package", "bridge_attachment_upload", "bridge_attachment_list", "bridge_attachment_download", "bridge_run", "bridge_pause", "bridge_disconnect", "bridge_panel"]);
 const CONTEXT_ONLY_TOOLS = new Set(["bridge_host_status", "artifact_workspace_status", "artifact_workspace_read", "bridge_swarm_list", "bridge_swarm_create", "bridge_swarm_status", "bridge_swarm_resume", "bridge_swarm_run", "bridge_swarm_pause", "bridge_swarm_stop"]);
 for (const tool of TOOLS) {
   if (!tool.inputSchema?.properties || PUBLIC_BRIDGE_TOOLS.has(tool.name) || CONTEXT_ONLY_TOOLS.has(tool.name) || tool.name === "brain_provider_list" || tool.name === "executor_provider_list" || tool.name.includes("session_") || tool.name.startsWith("bridge_route_")) continue;
@@ -4824,6 +5332,11 @@ const ROUTE_WORKER_TOOLS = new Set([
   "bridge_status",
   "bridge_send",
   "bridge_receive",
+  "bridge_reconcile",
+  "bridge_attachment_package",
+  "bridge_attachment_upload",
+  "bridge_attachment_list",
+  "bridge_attachment_download",
   "bridge_run",
   "bridge_pause",
   "bridge_disconnect",
@@ -4857,6 +5370,11 @@ async function callToolDirect(name, args) {
   if (name === "bridge_focus") return bridgeFocus(args);
   if (name === "bridge_send") return bridgeSend(args);
   if (name === "bridge_receive") return bridgeReceive(args);
+  if (name === "bridge_reconcile") return bridgeReconcile(args);
+  if (name === "bridge_attachment_package") return bridgeAttachmentPackage(args);
+  if (name === "bridge_attachment_upload") return bridgeAttachmentUpload(args);
+  if (name === "bridge_attachment_list") return bridgeAttachmentList(args);
+  if (name === "bridge_attachment_download") return bridgeAttachmentDownload(args);
   if (name === "bridge_run") return bridgeRun(args);
   if (name === "bridge_pause") return bridgePause(args);
   if (name === "bridge_disconnect") return bridgeDisconnect(args);

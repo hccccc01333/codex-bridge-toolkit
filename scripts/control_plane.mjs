@@ -18,6 +18,7 @@ const MAX_PENDING_EVENTS = 40;
 const ROUTE_LOCK_LEASE_MS = 120000;
 const ROUTE_LOCK_POLL_MS = 50;
 const WEB_DELIVERY_FILE = path.join(ROUTE_DIR, "web-deliveries.json");
+const RELAY_HANDOFF_FILE = path.join(ROUTE_DIR, "relay-handoffs.json");
 const routeQueues = new Map();
 let controlDb = null;
 
@@ -61,6 +62,23 @@ function getControlDb() {
       formatted_content TEXT,
       error TEXT,
       reply_length INTEGER,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS relay_handoffs (
+      handoff_id TEXT PRIMARY KEY,
+      route_id TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      state TEXT NOT NULL,
+      provider TEXT,
+      source_message_id TEXT,
+      content_hash TEXT NOT NULL,
+      content_length INTEGER NOT NULL DEFAULT 0,
+      source_displayed_at TEXT,
+      source_observed_at TEXT,
+      destination_observed_at TEXT,
+      delivery_id TEXT,
+      error TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -206,6 +224,122 @@ export function removeWebDelivery(deliveryId) {
   return existed;
 }
 
+function parseRelayHandoffRow(row) {
+  if (!row) return null;
+  return {
+    handoff_id: String(row.handoff_id || ""),
+    route_id: String(row.route_id || ""),
+    direction: String(row.direction || ""),
+    state: String(row.state || "unknown"),
+    provider: row.provider || null,
+    source_message_id: row.source_message_id || "",
+    content_hash: String(row.content_hash || ""),
+    content_length: Number(row.content_length || 0),
+    source_displayed_at: row.source_displayed_at || null,
+    source_observed_at: row.source_observed_at || null,
+    destination_observed_at: row.destination_observed_at || null,
+    delivery_id: row.delivery_id || null,
+    error: row.error || null,
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null,
+  };
+}
+
+function readFallbackRelayHandoffs() {
+  fs.mkdirSync(ROUTE_DIR, { recursive: true });
+  try {
+    const parsed = JSON.parse(fs.readFileSync(RELAY_HANDOFF_FILE, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (error) {
+    if (error?.code === "ENOENT") return {};
+    return {};
+  }
+}
+
+function writeFallbackRelayHandoffs(handoffs) {
+  fs.mkdirSync(ROUTE_DIR, { recursive: true });
+  fs.writeFileSync(RELAY_HANDOFF_FILE, `${JSON.stringify(handoffs, null, 2)}\n`, "utf8");
+}
+
+export function readRelayHandoffs(routeId, { limit = 60 } = {}) {
+  const id = normalizeRouteId(routeId);
+  const boundedLimit = Math.min(200, Math.max(1, Number(limit) || 60));
+  const db = getControlDb();
+  if (db) {
+    return db.prepare(`
+      SELECT * FROM relay_handoffs WHERE route_id = ?
+      ORDER BY updated_at DESC LIMIT ?
+    `).all(id, boundedLimit).map(parseRelayHandoffRow);
+  }
+  return Object.values(readFallbackRelayHandoffs())
+    .filter(record => record?.route_id === id)
+    .sort((left, right) => Date.parse(right.updated_at || 0) - Date.parse(left.updated_at || 0))
+    .slice(0, boundedLimit)
+    .map(parseRelayHandoffRow);
+}
+
+export function writeRelayHandoff(handoffId, fields = {}) {
+  const id = String(handoffId || "").trim();
+  if (!id) throw new Error("handoff_id is required");
+  const routeId = normalizeRouteId(fields.route_id);
+  const previous = readRelayHandoffs(routeId, { limit: 200 }).find(item => item.handoff_id === id) || null;
+  const timestamp = now();
+  const record = {
+    handoff_id: id,
+    route_id: routeId,
+    direction: String(fields.direction ?? previous?.direction ?? "").trim(),
+    state: String(fields.state ?? previous?.state ?? "observed").trim(),
+    provider: fields.provider ?? previous?.provider ?? null,
+    source_message_id: fields.source_message_id ?? previous?.source_message_id ?? "",
+    content_hash: String(fields.content_hash ?? previous?.content_hash ?? "").trim(),
+    content_length: Number(fields.content_length ?? previous?.content_length ?? 0),
+    source_displayed_at: fields.source_displayed_at ?? previous?.source_displayed_at ?? null,
+    source_observed_at: fields.source_observed_at ?? previous?.source_observed_at ?? null,
+    destination_observed_at: fields.destination_observed_at ?? previous?.destination_observed_at ?? null,
+    delivery_id: fields.delivery_id ?? previous?.delivery_id ?? null,
+    error: fields.error ?? previous?.error ?? null,
+    created_at: previous?.created_at || fields.created_at || timestamp,
+    updated_at: timestamp,
+  };
+  if (!record.direction) throw new Error("relay handoff direction is required");
+  if (!record.content_hash) throw new Error("relay handoff content_hash is required");
+  const db = getControlDb();
+  if (db) {
+    db.prepare(`
+      INSERT INTO relay_handoffs (
+        handoff_id, route_id, direction, state, provider, source_message_id,
+        content_hash, content_length, source_displayed_at, source_observed_at,
+        destination_observed_at, delivery_id, error, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(handoff_id) DO UPDATE SET
+        route_id = excluded.route_id,
+        direction = excluded.direction,
+        state = excluded.state,
+        provider = excluded.provider,
+        source_message_id = excluded.source_message_id,
+        content_hash = excluded.content_hash,
+        content_length = excluded.content_length,
+        source_displayed_at = excluded.source_displayed_at,
+        source_observed_at = excluded.source_observed_at,
+        destination_observed_at = excluded.destination_observed_at,
+        delivery_id = excluded.delivery_id,
+        error = excluded.error,
+        created_at = excluded.created_at,
+        updated_at = excluded.updated_at
+    `).run(
+      record.handoff_id, record.route_id, record.direction, record.state, record.provider,
+      record.source_message_id, record.content_hash, record.content_length,
+      record.source_displayed_at, record.source_observed_at, record.destination_observed_at,
+      record.delivery_id, record.error, record.created_at, record.updated_at,
+    );
+    return record;
+  }
+  const handoffs = readFallbackRelayHandoffs();
+  handoffs[id] = record;
+  writeFallbackRelayHandoffs(handoffs);
+  return record;
+}
+
 function lockOwner(routeId) {
   return `${process.pid}:${routeId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -327,6 +461,7 @@ export function newRouteRecord(routeId, fields = {}) {
     latest_task: fields.latest_task || null,
     latest_report: fields.latest_report || null,
     latest_review: fields.latest_review || null,
+    relay_recovery: fields.relay_recovery || fields.relayRecovery || null,
     queue: {
       pending_count: 0,
       active: null,
@@ -415,6 +550,7 @@ export function routeSummary(route) {
     latest_task: route.latest_task || null,
     latest_report: route.latest_report || null,
     latest_review: route.latest_review || null,
+    relay_recovery: route.relay_recovery || null,
     queue: {
       pending_count: route.queue?.pending_count || 0,
       active: route.queue?.active || null,

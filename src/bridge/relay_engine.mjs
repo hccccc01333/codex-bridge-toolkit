@@ -113,7 +113,7 @@ export function createRelayEngine({
       conversationId,
       conversationTitle,
       relayId: state.relay_id,
-      sourceMessageId,
+      sourceMessageId: result.source_message_id || sourceMessageId,
       turnIndex,
       content: result.content,
     });
