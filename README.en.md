@@ -400,4 +400,3 @@ More design notes:
 - [Toolkit series design](docs/toolkit-series.md)
 - [OpenCode configuration template](examples/opencode/README.md)
 - [Codex native integration boundary](docs/codex-native-integration.md)
-- [Demo recording script](docs/demo-script.md)

@@ -18,3 +18,7 @@ browser-profile/
 Thumbs.db
 .idea/
 .vscode/
+
+# Local-only demo recording material
+scripts/record_demo.ps1
+docs/demo-script.md

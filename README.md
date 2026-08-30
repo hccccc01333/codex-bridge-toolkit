@@ -407,5 +407,4 @@ git diff --check
 - [工具包系列设计](docs/toolkit-series.md)
 - [OpenCode 配置模板](examples/opencode/README.md)
 - [Codex 原生集成边界](docs/codex-native-integration.md)
-- [演示录制脚本](docs/demo-script.md)
 - [English README](README.en.md)
