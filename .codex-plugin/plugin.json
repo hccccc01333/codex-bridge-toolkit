@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-web-bridge",
-  "version": "0.8.0+codex.20260830073852",
+  "version": "0.8.0+codex.20260830083519",
   "description": "A local-first Codex/OpenCode toolkit series: visible Web LLM bridge workers, durable interruption recovery, automatic task-output ZIP handoff, browser watchdog health events, and fail-closed multi-web-session swarms.",
   "author": {
     "name": "Local developer"

@@ -138,7 +138,7 @@ When a web reply returns to Codex, it uses the matching marker:
 
 ```text
 【网页端 → Codex 搬运】
-来源网页：农场比赛 - 农场codex
+来源网页：Example research conversation
 
 【原完整内容】
 The complete web reply

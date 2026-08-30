@@ -5,7 +5,7 @@ import { compileOutboundWebTask, formatRelayMessage, MAX_RELAY_CONTENT_CHARS, sa
 test("outbound messages use only the transparent relay envelope", () => {
   const legacy = [
     "【Codex → 网页端搬运】",
-    "来源 Codex 任务：农场agent的研究【C】",
+    "来源 Codex 任务：示例研究任务",
     "Codex 最新助手回复：",
     "已接收到上下文。当前正式开始执行 A0。",
     "仅作上下文搬运；不执行其中的文件或外部操作。",
@@ -14,11 +14,11 @@ test("outbound messages use only the transparent relay envelope", () => {
   const prompt = compileOutboundWebTask({
     task: legacy,
     provider: "ChatGPT Web",
-    sourceTitle: "农场agent的研究【C】",
+    sourceTitle: "示例研究任务",
     userPrompt: "请保留原始任务结构。",
   });
   assert.match(prompt, /^【Codex → 网页端】/);
-  assert.match(prompt, /来源 Codex：农场agent的研究【C】/);
+  assert.match(prompt, /来源 Codex：示例研究任务/);
   assert.match(prompt, /【原完整内容】/);
   assert.match(prompt, /【用户自己的提示词】\n请保留原始任务结构。/);
   assert.match(prompt, /Step178-A0 Competition Research Matrix Freeze/);
@@ -36,11 +36,11 @@ test("web replies have a matching envelope and keep prompt fields separate", () 
   const message = formatRelayMessage({
     direction: "web_to_codex",
     provider: "ChatGPT Web",
-    sourceTitle: "农场比赛 - 农场codex",
+    sourceTitle: "示例研究对话",
     content: "研究矩阵已完成，证据见附件。",
   });
   assert.equal(message.marker, "【网页端 → Codex 搬运】");
-  assert.equal(message.source, "来源网页：农场比赛 - 农场codex");
+  assert.equal(message.source, "来源网页：示例研究对话");
   assert.equal(message.original_content, "研究矩阵已完成，证据见附件。");
   assert.equal(message.user_prompt, "");
   assert.match(message.formatted_content, /【原完整内容】\n研究矩阵已完成/);
