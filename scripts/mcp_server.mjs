@@ -91,6 +91,12 @@ import {
   sha256File,
 } from "../src/bridge/web_attachments.mjs";
 import {
+  captureTaskArtifactBaseline,
+  collectTaskArtifactCandidates,
+  taskArtifactDeliveryKey,
+  undispatchedTaskArtifacts,
+} from "../src/bridge/task_artifacts.mjs";
+import {
   appendSwarmEvent,
   findSwarmByName,
   listSwarms,
@@ -1738,6 +1744,19 @@ async function executorReport(args = {}) {
   if (!report.report.trim() || report.report === "{}") {
     return jsonResult("report, result, summary, or execution fields are required", { reported: false }, true);
   }
+  let artifactTransfer;
+  try {
+    artifactTransfer = await prepareAutomaticTaskArtifactUpload(report, args);
+  } catch (error) {
+    const reason = `任务产物无法完整交接，未发送执行报告：${String(error)}`;
+    await pauseActiveBridge(reason, error.code || "TASK_ARTIFACT_HANDOFF_FAILED");
+    return jsonResult(reason, publicBridgeLink({
+      reported: false,
+      task_artifacts: { state: "blocked", attached: false, reason: String(error) },
+      requires_resume: true,
+    }), true);
+  }
+  report.task_artifacts = publicTaskArtifactTransfer(artifactTransfer);
   brainState.latestReport = report;
   recordReport(report);
   const result = await askBrain({
@@ -1746,7 +1765,13 @@ async function executorReport(args = {}) {
     timeout_ms: args.timeout_ms,
     prompt: reportPrompt(brainState.goal, brainState.round, JSON.stringify(report, null, 2)),
   });
-  if (result.isError) return result;
+  if (result.isError) {
+    if (artifactTransfer?.attached) {
+      await pauseActiveBridge("网页端已附加任务产物，但执行报告未被确认发送；为避免重复或丢失，连接已暂停", "TASK_ARTIFACT_REPORT_UNCONFIRMED");
+    }
+    return result;
+  }
+  commitAutomaticTaskArtifactUpload(artifactTransfer, report);
   const acknowledgement = resultText(result);
   brainState.lastWebReply = acknowledgement;
   persistActiveSession();
@@ -1754,6 +1779,7 @@ async function executorReport(args = {}) {
     reported: true,
     round: report.round,
     report,
+    task_artifacts: publicTaskArtifactTransfer(artifactTransfer),
     web_ack: acknowledgement,
   });
 }
@@ -3569,6 +3595,11 @@ async function bridgeGoalCreate(args = {}) {
     goal_source: compiled.source,
   };
   activeRelayEngine?.setGoal?.(goal);
+  // The goal is the provenance boundary for automatic artifact transfer.
+  // Anything already dirty at this point remains local unless the user uses
+  // the explicit attachment tools; subsequent safe Git deltas belong to this
+  // bridge task and can travel with executor reports.
+  await captureActiveTaskArtifactBaseline(args);
 
   // Bounded/continuous Brain-Hand links use a real Codex App Server worker.
   // Set its native Goal as soon as it exists; one-shot links stay lightweight
@@ -3880,6 +3911,182 @@ function attachmentWorkspace(args = {}) {
   return args.cwd || activeBridgeLink?.workspace?.root || activeRoute?.workspace?.root || process.cwd();
 }
 
+function publicTaskArtifactTransfer(transfer = {}) {
+  if (!transfer || typeof transfer !== "object") return { state: "not_checked", attached: false };
+  return {
+    state: transfer.state || "not_checked",
+    attached: Boolean(transfer.attached),
+    source_file_count: Number(transfer.source_file_count || 0),
+    source_files: Array.isArray(transfer.source_files)
+      ? transfer.source_files.map(file => ({ relative_path: file.relative_path, bytes: file.bytes, sha256: file.sha256 }))
+      : [],
+    package: transfer.package ? {
+      name: transfer.package.name,
+      bytes: transfer.package.bytes,
+      sha256: transfer.package.sha256,
+    } : null,
+    skipped_count: Number(transfer.skipped_count || 0),
+    reason: transfer.reason || null,
+  };
+}
+
+async function captureActiveTaskArtifactBaseline(args = {}) {
+  if (!activeBridgeLink) return null;
+  const baseline = await captureTaskArtifactBaseline({ cwd: attachmentWorkspace(args) });
+  const record = {
+    mode: "automatic_executor_report",
+    baseline,
+    delivered: {},
+    last_handoff: null,
+  };
+  activeBridgeLink.task_artifacts = record;
+  activeRoute = updateRoute(activeBridgeLink.route_id, { task_artifacts: record, last_action: "task_artifact_baseline" });
+  appendRouteEvent(activeBridgeLink.route_id, {
+    type: "TASK_ARTIFACT_BASELINE",
+    summary: baseline.state === "ready"
+      ? `task artifact baseline captured (${baseline.preexisting_count} pre-existing change(s) excluded)`
+      : "task artifact baseline unavailable; automatic file handoff is disabled for this goal",
+    data: { state: baseline.state, preexisting_count: baseline.preexisting_count, reason: baseline.reason || null },
+  });
+  return record;
+}
+
+function activeTaskArtifactRecord() {
+  if (!activeBridgeLink) return null;
+  if (activeBridgeLink.task_artifacts) return activeBridgeLink.task_artifacts;
+  const persisted = readRoute(activeBridgeLink.route_id)?.task_artifacts || null;
+  if (persisted) activeBridgeLink.task_artifacts = persisted;
+  return persisted;
+}
+
+async function prepareAutomaticTaskArtifactUpload(report = {}, args = {}) {
+  if (!activeBridgeLink) return { state: "not_linked", attached: false, source_file_count: 0, source_files: [] };
+  const record = activeTaskArtifactRecord();
+  const scan = await collectTaskArtifactCandidates({
+    baseline: record?.baseline,
+    delivered: record?.delivered || {},
+  });
+  if (scan.state !== "ready") {
+    return {
+      state: "unavailable",
+      attached: false,
+      source_file_count: 0,
+      source_files: [],
+      skipped_count: 0,
+      reason: scan.reason,
+    };
+  }
+  if (!scan.files.length) {
+    return {
+      state: "no_new_artifacts",
+      attached: false,
+      source_file_count: 0,
+      source_files: [],
+      skipped_count: scan.skipped.length,
+    };
+  }
+  const selected = resolveSelectedAttachmentFiles({
+    cwd: scan.workspace_root,
+    files: scan.files.map(file => file.relative_path),
+  });
+  const candidates = [];
+  for (const file of selected.files) {
+    candidates.push({ ...file, sha256: await sha256File(file.absolute_path) });
+  }
+  const pending = undispatchedTaskArtifacts(candidates, record?.delivered || {});
+  if (!pending.length) {
+    return {
+      state: "no_new_artifacts",
+      attached: false,
+      source_file_count: 0,
+      source_files: [],
+      skipped_count: scan.skipped.length,
+    };
+  }
+
+  let uploadFiles = pending;
+  let packageInfo = null;
+  if (pending.length > 1) {
+    const packaged = await packageSelectedAttachments({
+      cwd: selected.workspace_root,
+      files: pending.map(file => file.relative_path),
+      archive_name: `bridge-task-output-round-${Math.max(1, Number(report.round || 0) + 1)}`,
+    });
+    const archive = resolveSelectedAttachmentFiles({
+      cwd: selected.workspace_root,
+      files: [packaged.archive_relative_path],
+    });
+    uploadFiles = archive.files;
+    packageInfo = {
+      name: packaged.archive_name,
+      bytes: packaged.archive_bytes,
+      sha256: packaged.archive_sha256,
+      relative_path: packaged.archive_relative_path,
+    };
+  }
+
+  const { provider } = await verifyBridgeDestination();
+  const uploaded = await uploadSelectedAttachments(provider, uploadFiles);
+  const transfer = {
+    state: "attached",
+    attached: true,
+    source_file_count: pending.length,
+    source_files: pending.map(file => ({
+      relative_path: file.relative_path,
+      bytes: file.bytes,
+      sha256: file.sha256,
+    })),
+    package: packageInfo,
+    uploaded_names: uploaded.names,
+    skipped_count: scan.skipped.length,
+  };
+  activeBridgeLink.pending_auto_attachments = transfer;
+  appendRouteEvent(activeBridgeLink.route_id, {
+    type: "TASK_ARTIFACT_ATTACHED",
+    summary: packageInfo
+      ? `${pending.length} task artifact(s) packaged and attached to the bound web composer`
+      : "one task artifact attached to the bound web composer",
+    data: {
+      count: pending.length,
+      package: packageInfo?.name || null,
+      skipped_count: scan.skipped.length,
+    },
+  });
+  return transfer;
+}
+
+function commitAutomaticTaskArtifactUpload(transfer = {}, report = {}) {
+  if (!activeBridgeLink || transfer.state !== "attached") return;
+  const record = activeTaskArtifactRecord();
+  if (!record) return;
+  const delivered = { ...(record.delivered || {}) };
+  for (const file of transfer.source_files || []) {
+    delivered[file.relative_path] = taskArtifactDeliveryKey(file);
+  }
+  const next = {
+    ...record,
+    delivered,
+    last_handoff: {
+      at: new Date().toISOString(),
+      round: Number(report.round || 0),
+      source_file_count: Number(transfer.source_file_count || 0),
+      package: transfer.package ? {
+        name: transfer.package.name,
+        bytes: transfer.package.bytes,
+        sha256: transfer.package.sha256,
+      } : null,
+    },
+  };
+  activeBridgeLink.task_artifacts = next;
+  activeBridgeLink.pending_auto_attachments = null;
+  activeRoute = updateRoute(activeBridgeLink.route_id, { task_artifacts: next, last_action: "task_artifact_handoff" });
+  appendRouteEvent(activeBridgeLink.route_id, {
+    type: "TASK_ARTIFACT_DELIVERED",
+    summary: `${transfer.source_file_count} task artifact(s) delivered with executor report`,
+    data: { count: transfer.source_file_count, package: transfer.package?.name || null },
+  });
+}
+
 async function bridgeAttachmentPackage(args = {}) {
   try {
     const packaged = await packageSelectedAttachments({
@@ -4038,6 +4245,7 @@ async function bridgeRun(args = {}) {
       true,
     );
   }
+  if (!activeTaskArtifactRecord()) await captureActiveTaskArtifactBaseline(args);
   if (activeBridgeRun?.state === "running") {
     return jsonResult("网页端循环已经在后台运行，请使用网页端连接状态查看进度", publicBridgeLink({ started: false, already_running: true }));
   }

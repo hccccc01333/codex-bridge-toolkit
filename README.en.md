@@ -162,17 +162,19 @@ Latest Codex → web send has no stable reply → wait for web; never resend aut
 
 When timestamps tie, the Codex peer cannot be read, or the destination changed, the result is paused/low-confidence instead of a guess. Reconciliation recommends a safe next initiator only; resuming or sending remains an explicit user action.
 
-### File handoff: ZIP, upload, and download
+### File handoff: task outputs travel with executor reports
 
-To give several local deliverables to a ChatGPT web conversation, use three explicit steps:
+In Brain-Hand mode, task files are part of an executor report—not a separate checklist for the user. Creating a Bridge Goal captures the current Git workspace baseline. Before every `executor_report`, the bridge automatically handles safe outputs created by that task:
 
 ```text
-1. bridge_attachment_package: package named workspace files into .codex-bridge/attachments/*.zip
-2. bridge_attachment_upload: add that ZIP (or explicitly selected individual files) to the verified web composer
-3. bridge_send: explicitly send the accompanying chat message
+0 new outputs: send the complete execution report
+1 new output: attach it to the same verified web conversation, then send the report
+2+ new outputs: create .codex-bridge/attachments/*.zip automatically, attach it to that conversation, then send the report
 ```
 
-Upload only adds files to the composer; it never sends a chat message implicitly. The tool accepts regular files explicitly named inside the workspace, up to 100 files / 500 MB, retains generated ZIP files, and never overwrites an existing archive.
+Automatic delivery is limited to Git changes that appeared after the goal baseline. It excludes pre-existing changes, `.git`, `node_modules`, `.codex-bridge`, build caches, and sensitive paths such as `.env`, keys, certificates, and credential files. An unchanged path with the same SHA-256 is not uploaded twice. The limit is 100 source files / 500 MB. If eligible outputs cannot be completely packaged or the page does not confirm the attachment, the report is not sent partially and the link pauses.
+
+`bridge_attachment_package` and `bridge_attachment_upload` remain available for deliberate extra/manual transfers. Those manual tools only add files to the composer; they do not implicitly send a chat message.
 
 For a web-to-Codex file handoff, call `bridge_attachment_list` first, then choose one `attachment_id` with `bridge_attachment_download`. The file is saved only under `.codex-bridge/downloads/` in the active workspace (or another user-selected workspace-relative directory) and returns its relative path, size, and SHA-256. If the browser cannot use a controlled download directory, the visible attachment changes, or completion cannot be verified, the bridge pauses; it never clicks again or switches tabs.
 
@@ -248,7 +250,7 @@ See [examples/opencode/](examples/opencode/) for a copyable template. Use OpenCo
 | Goal and evidence loop | ✅ | plan → execute → report → review; completion requires evidence |
 | Multi-web-session Swarm | ✅ experimental | Independent worker, target, and watchdog per member; group pauses on failure |
 | Interruption attribution and recovery advice | ✅ | Compares the latest web/Codex message timestamps with durable handoffs; recommends the next initiator only, never auto-resends |
-| ChatGPT web file handoff | ✅ | Explicit ZIP packaging, same-conversation upload, and visible attachment selection for download; failure pauses |
+| ChatGPT web file handoff | ✅ | Brain-Hand task outputs auto-package/upload to the same conversation; extra local files and web downloads remain explicit; failure pauses |
 | Local GitHub workspace | ✅ read-only | Captures repository, branch, HEAD, and change-count summaries; no automatic pull/push/commit |
 | Local artifact tools | 🟡 | Discovers Word/PPT/PDF metadata; reads explicitly selected Markdown/text/CSV only |
 | Notion / Word / PPT body collaboration | ⏳ | Body adapters are not included in this release |
